@@ -38,14 +38,6 @@ if(!(test-path $jsonFolder)){
     new-item -itemtype directory -path $jsonFolder -Force
 }
 
-#$dnsMappingTable = [ordered]@{}
-#$ciscoTTL = [ordered]@{}
-#$nixTTL = [ordered]@{}
-#$windowsTTL = [ordered]@{}
-#$windowsServers = [system.collections.arraylist]@()
-#$windowsHosts = [system.collections.arraylist]@()
-#$unknownHosts = [system.collections.arraylist]@()
-#$liveHostsNotInDNS = [system.collections.arraylist]@()
 $adEnumeration = $false
 $winrm = $true
 $localBox = $false
@@ -114,68 +106,6 @@ function Repair-PSSessions{
     $sessions | ?{$_.state -eq "Broken"} | New-PSSession -SessionOption (New-PSSessionOption -NoMachineProfile -MaxConnectionRetryCount 5)
     Get-PSSession | ?{$_.state -eq "Broken"} | Remove-PSSession 
 }
-
-<#function Create-Artifact{
-
-    Repair-PSSessions
-    
-    $poll = $true
-    while($poll){
-        
-        Get-job | ft
-        foreach($job in (get-job)){
-
-            $time = (Get-date)
-            $elapsed = ($time - $job.PSBeginTime).minutes
-            
-            if(($job.state -eq "completed")){
-
-                $ComputerName = $job.Location
-
-                $Task = $job.name
-                
-                if($Task -ne "Prefetch"){
-                    
-                    if($windowsHosts.contains($computername.toUpper())){
-                        Receive-Job $job.id | export-csv -force -append -NoTypeInformation -path "$rawFolder\Host $Task.csv" | out-null
-                    }elseif($windowsServers.Contains($ComputerName.toUpper())){
-                        Receive-Job $job.id | export-csv -force -append -NoTypeInformation -path "$rawFolder\Server $Task.csv" | out-null
-                    }else{
-                        Receive-Job $job.id | export-csv -force -append -NoTypeInformation -path "$rawFolder\Unknown $Task.csv" | out-null
-                    }
-                #This is for prefetch.
-                }
-                else{
-                
-                    Receive-Job $job.id | out-null
-                }if(!($job.hasmoredata)){
-                    remove-job $job.id -force 
-                }
-                
-            }
-            
-            elseif($job.state -eq "failed"){
-
-                $job | export-csv -Append -NoTypeInformation "$outFolder\failedjobs.csv"
-                Remove-Job $job.id -force
-
-            }
-            elseif(($elapsed -ge $jobTimeOutThreshold) -and ($job.state -ne "Completed")){
-                $job | stop-job
-            }
-            elseif($job.state -eq "Running"){
-                continue
-            }
-        }Start-Sleep -Seconds 8
-        if((get-job | where state -eq "completed" |measure).Count -eq 0){
-            if((get-job | where state -eq "failed" |measure).Count -eq 0){
-                if((get-job | where state -eq "Running" |measure).Count -lt $runningJobThreshold){
-                    $poll = $false
-                }                
-            }
-        }
-    }
-}#>
 
 function Create-Artifact{
 <#
@@ -373,196 +303,6 @@ while ($FirstHost -lt $LastHost) {
    return $IPSubnetList
 }
 
-<#function Enumerator([System.Collections.ArrayList]$iparray){
-
-
-    if($adEnumeration){
-        Write-host -ForegroundColor Green "[+]Checking Windows OS Type"
-   
-        foreach($i in $iparray){
-            if($i -ne $null){                
-                    (Invoke-Command -ComputerName $i -ScriptBlock  {(gwmi win32_operatingsystem).caption} -AsJob -JobName $i) | out-null               
-                    }
-                }get-job | wait-job | out-null
-       }
-    else{
-        
-        $task = foreach($ip in $iparray){
-            ((New-Object System.Net.NetworkInformation.Ping).SendPingAsync($ip))
-        }[threading.tasks.task]::WaitAll($task)
-
-        $status = foreach($i in $task){$i.result.status}
-        
-        $addresses = foreach($i in $task.result){($i.address).Ipaddresstostring}
-        
-        $addresses = ($addresses | group | select count,name | sort count | ?{$_.count -eq 1}).name 
-
-        $result = $task.Result
-        $result = $result | ?{$_.status -eq "Success"}
-        write-host -ForegroundColor Green "[+]There are" ($result | measure).count "total live hosts."
-        foreach($i in $result){
-            $ttl = $i.options.ttl
-            if($ttl -le 64 -and $ttl -ge 45){
-                if(!$nixTTL.contains($i.address)){
-                    $nixTTL.add($i.address,$ttl)
-                }
-            }elseif($ttl -le 128 -and $ttl -ge 115){
-                if(!$windowsTTL.contains($i.address)){
-                    $windowsTTL.add($i.address,$ttl)
-                }
-            }elseif($ttl -le 255 -and $ttl -ge 230){
-                if(!$ciscoTTL.contains($i.address)){
-                    $ciscoTTL.add($i.address,$ttl)
-                }
-            }
-        }
-
-        Write-Host -ForegroundColor Green "[+]Connection Testing Complete beep boop beep"
-        Write-Host -ForegroundColor Green "[+]Starting Reverse DNS Resolution"
-
-        
-        $dnsTask = foreach($i in $addresses){
-                    [system.net.dns]::GetHostEntryAsync($i)
-                    
-        }[threading.tasks.task]::WaitAll($dnsTask) | out-null
-
-        foreach($i in $dnsTask){
-            if($i.status -ne "Faulted"){
-                #if($i.result.addresslist.Ipaddresstostring -ne $null){
-                    $hostname = (($i.result.hostname).split('.')[0]).toUpper()
-                    $ip = ($i.result.addresslist.Ipaddresstostring)
-                    if($ip -ne $null -and $hostname -ne $Null){
-                        $dnsMappingTable.Add(($i.result.addresslist.Ipaddresstostring),$hostname) | out-null
-                    }
-                #}
-            }      
-        }
-        foreach($i in $addresses){
-            if(!($dnsMappingTable.Contains($i))){
-                $liveHostsNotInDNS.Add($i) | out-null
-            }
-        }
-            
-        Write-Host -ForegroundColor Green "[+]Reverse DNS Resolution Complete"
-        
-        #write-host -ForegroundColor Red "There are" $liveHostsNotInDNS.count "live hosts that are not in DNS."
-
-        
-        $nixTTL.getEnumerator() | Select-Object -Property @{N='IPAddress';E={$_.key}},@{N='TTL';E={$_.value}} | Export-Csv -path "$outfolder\NixTTL.csv" -NoTypeInformation
-        Write-Host -ForegroundColor Green "[+]NixTTL.csv created"
-
-        
-        $windowsTTL.getEnumerator() | Select-Object -Property @{N='IPAddress';E={$_.key}},@{N='TTL';E={$_.value}} | Export-Csv -path "$outfolder\WindowsTTL.csv" -NoTypeInformation
-        Write-Host -ForegroundColor Green "[+]WindowsTTL.csv created"
-
-        
-        $ciscoTTL.getEnumerator() | Select-Object -Property @{N='IPAddress';E={$_.key}},@{N='TTL';E={$_.value}} | Export-Csv -path "$outfolder\CiscoTTL.csv" -NoTypeInformation
-        Write-Host -ForegroundColor Green "[+]CiscoTTL.csv created"
-
-        
-        $liveHostsNotInDNS.GetEnumerator() | Select-Object -Property @{N='IPAddress';E={$_}} | Export-Csv -path "$outfolder\LiveHostsNotInDNS.csv" -NoTypeInformation
-        Write-Host -ForegroundColor Green "[+]LiveHostsNotInDNS.csv created"   
-
-        Write-host -ForegroundColor Green "[+]Checking Windows OS Type"
-
-        foreach($i in $dnsMappingTable.Values){
-            if($i -ne $null){
-                (Invoke-Command -ComputerName $i -ScriptBlock  {gwmi win32_operatingsystem -ErrorAction SilentlyContinue} -AsJob -JobName "OSIdentification") | out-null               
-            }                      
-        }
-        foreach($i in $liveHostsNotInDNS){
-
-            Start-Job -Name $i -ScriptBlock {gwmi win32_operatingsystem -ComputerName $using:i -ErrorAction SilentlyContinue} |Out-Null
-        }
-        
-    }
-        Write-Host -ForegroundColor Green "[+]All OS Jobs Started"
-    
-    $poll = $true
-    $knownHosts = [object[]]::new($dnsMappingTable.count)
-    $dnsMappingTable.Values.CopyTo($knownHosts,0)
-    
-    $refTime = (Get-Date)
-    while($poll){
-        
-        foreach($job in (get-job)){
-            $time = (Get-Date)
-            $elapsed = ($time - $job.PSBeginTime).minutes
-            if($job.state -eq "completed"){
-
-                $osinfo = Receive-Job $job -ErrorAction SilentlyContinue
-                
-                if($osinfo -ne $null){
-
-                    $hostname = (($osinfo.CSName).split('.')[0]).toUpper()
-
-                    if(!($knownHosts.Contains($hostname))){
-                        Write-Host -ForegroundColor Green "[+]Previously unknown host:" $hostname "being added to DNSMapper"
-                        $dnsMappingTable.add($job.Name,$hostname)
-                    }
-                
-                    if(($osinfo.caption -like "*enterprise*") -or ($osinfo.caption -like "*Pro*")){
-
-                        write-host -ForegroundColor Green "[+]" $osinfo.CSName "is a Windows Host"
-                        if(!$windowsHosts.Contains($hostname)){
-                            $windowsHosts.Add($hostname) | out-null
-                        }
-                    }elseif($osinfo.caption -like "*server*"){
-
-                        write-host -ForegroundColor Yellow "[+]" $osinfo.CSName "is a Windows Server"
-                        if(!$windowsServers.Contains($hostname)){
-                            $windowsServers.Add($hostname) | out-null
-                        }
-
-                    }
-                }
-                remove-job $job
-            }
-            elseif($job.State -eq "failed"){
-                Remove-Job $job.id -Force
-            }
-            elseif(($elapsed -ge $jobTimeOutThreshold) -and ($job.state -ne "Completed")){
-                Write-Host "Stopping Job:" $job.Name
-                $job | stop-job
-            }
-                           
-        } Start-Sleep -Seconds 8
-        if((get-job | where state -eq "completed" |measure).Count -eq 0){
-            if((get-job | where state -eq "failed" |measure).Count -eq 0){
-                if((get-job | where state -eq "Running" |measure).Count -lt $runningJobThreshold){
-                    $poll = $false
-                    Write-Host "Total Elapsed:" ((get-date) - $refTime).Minutes
-                }
-            }
-        }     
-    }
-
-    $windowsHosts = $windowsHosts | sort -Unique
-    $windowsServers = $windowsServers | sort -Unique
-
-        
-        foreach($i in $addresses){
-            if(($dnsMappingTable.Contains($i))){
-                $liveHostsNotInDNS.Remove($i) | out-null
-            }
-        }
-
-    
-    $dnsMappingTable.getEnumerator() | Select-Object -Property @{N='IPAddress';E={$_.key}},@{N='Hostname';E={$_.value}} | Export-Csv -path "$outfolder\DnsMapper.csv" -NoTypeInformation
-    Write-Host -ForegroundColor Green "[+]DnsMapper.csv created"
-
-    Get-Job
-    write-host -ForegroundColor Green "Operating System identification jobs are done."
-    Write-Host -ForegroundColor Green "[AUTH] Windows Workstations`t" $windowsHosts.Count
-    Write-Host -ForegroundColor Green "[AUTH] Windows Servers`t`t"      $windowsServers.Count
-    Write-Host -ForegroundColor Green "[TTL]  Windows`t`t`t"              $windowsTTL.count
-    Write-Host -ForegroundColor Green "[TTL]  *NIX`t`t`t"                 $nixTTL.count
-    Write-Host -ForegroundColor Green "[TTL]  Cisco`t`t`t"                $ciscoTTL.count
-    
-
-    Get-Job | ?{$_.state -ne "Stopped"} | Remove-Job -Force
-
-}#>
 
 function Enumerator([System.Collections.ArrayList]$iparray){
 <#
@@ -720,7 +460,7 @@ function Enumerator([System.Collections.ArrayList]$iparray){
 }
 
 function Memory-Dumper{
-
+    #TODO:Adapt this for other memory dump solutions like dumpit
      <#
         Create individual folders and files under $home\desktop\Meta-Blue
      #>
@@ -1513,34 +1253,6 @@ function ArpCache{
     }
 }
 
-function Steal-Prefetch{
-    if(!$localBox){
-        do{
-            $prefetch = Read-Host "Do you want to steal prefetch?(Y/N)"
-
-            if($prefetch -ieq 'y'){
-                <#
-                Create individual folders and files under $home\desktop\Meta-Blue
-                #>
-                foreach($i in $dnsMappingTable.Values){
-                    if(!(test-path $outFolder\$i)){
-                        new-item -itemtype directory -path $outFolder\$i -force
-                    }
-                }         
-                foreach($i in (Get-PSSession)){
-                    $ComputerName = $i.computername
-                    Write-host "Stealing Prefetch from" $ComputerName
-                    Copy-item -FromSession $i C:\windows\Prefetch\* -Destination "$outFolder\$computername\prefetch\" -ErrorAction SilentlyContinue | out-null         
-                }Get-Job | wait-job | out-null
-                return $true
-            }elseif($prefetch -ieq 'n'){
-                return $false
-            }else{
-                Write-Host "Not a valid option"
-            }
-        }while($true)
-    }
-}
 
 function Update-Sysmon{
 <#
@@ -1568,28 +1280,6 @@ function Update-Sysmon{
     }
 }
 
-function Find-Tiltwheel{
-    if(!$localBox){
-        do{
-            $findfile = Read-Host "Do you want to find tiltwheel?(Y/N)"
-            if($findfile -ieq 'y'){
-                foreach($i in Get-PSSession){
-                    Invoke-Command -Session $i -ScriptBlock {Set-Location "C:\Windows\system32"; Get-ChildItem | ?{$_.name -like "*tiltwheel*"} } -AsJob -JobName "Tiltwheelmouse" | Out-Null
-                }
-                Create-Artifact
-                return $true
-            
-            }elseif($findfile -ieq 'n'){
-                return $false
-            }else{
-                Write-Host "Not a valid option"
-            }
-        
-        }while($true)
-    
-    }
-    
-}
 
 function Find-File{
     if(!$localBox){
@@ -1641,50 +1331,6 @@ function TearDown-Sessions{
     }
 }
 
-<#function Build-Sessions{
-    if(!$localBox){
-        
-        $brokenSessions = (Get-PSSession | ?{$_.State -eq "Broken"}).Id
-        if($brokenSessions -ne $null){
-            Remove-PSSession -id $brokenSessions
-        }
-        $activeSessions = (Get-PSSession | ?{$_.State -eq "Opened"}).ComputerName
-
-        
-        foreach($i in $windowsHosts){
-            if($activeSessions -ne $null){
-                if(!$activeSessions.Contains($i)){
-                    Write-host "Starting PSSession on" $i
-                    New-pssession -computername $i -name $i -SessionOption (New-PSSessionOption -NoMachineProfile -MaxConnectionRetryCount 5) -ThrottleLimit 100| out-null
-                }else{
-                    Write-host "PSSession already exists:" $i -ForegroundColor Red
-                }
-            }else{
-                Write-host "Starting PSSession on" $i
-                New-pssession -computername $i -name $i -SessionOption (New-PSSessionOption -NoMachineProfile -MaxConnectionRetryCount 5) -ThrottleLimit 100| out-null
-            }
-        }
-        foreach($i in $windowsServers){
-            if($activeSessions -ne $null){
-                if(!$activeSessions.Contains($i)){
-                    Write-host "Starting PSSession on" $i
-                    New-pssession -computername $i -name $i -SessionOption (New-PSSessionOption -NoMachineProfile -MaxConnectionRetryCount 5) -ThrottleLimit 100| out-null
-                }else{
-                    Write-host "PSSession already exists:" $i -ForegroundColor Red
-                }
-            }else{
-                Write-host "Starting PSSession on" $i
-                New-pssession -computername $i -name $i -SessionOption (New-PSSessionOption -NoMachineProfile -MaxConnectionRetryCount 5) -ThrottleLimit 100| out-null
-            }
-        }
-    
-        if((Get-PSSession | measure).count -eq 0){
-            return
-        }    
-
-        write-host -ForegroundColor Green "There are" ((Get-PSSession | measure).count) "Sessions."
-    } 
-}#>
 
 function Build-Sessions{
     if(!$localBox){
@@ -1979,6 +1625,20 @@ function HistoricalFirewallChanges{
 
 }
 
+function CapabilityAccessManager{
+    
+    Write-host "Starting CapabilityAccessManager Jobs"
+    if($localBox){
+        (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\*\NonPackaged\*) | export-csv -NoTypeInformation -Append "$outFolder\Local CapabilityAccessManager.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock  {(Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\*\NonPackaged\*)}  -asjob -jobname "CapabilityAccessManager") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
 function Meta-Blue {    
     <#
         This is the data gathering portion of this script. PSSessions are created on all live windows
@@ -1992,7 +1652,10 @@ function Meta-Blue {
         Begining the artifact collection. Will start one job per session and then wait for all jobs
         of that type to complete before moving on to the next set of jobs.
     #>
-    Write-host -ForegroundColor Green "Begin Artifact Gathering"   
+    Write-host -ForegroundColor Green "[+]Begin Artifact Gathering"  
+    Write-Host -ForegroundColor Yellow "[+]Sometimes the Powershell window needs you to click on it and press enter"
+    Write-Host -ForegroundColor Yellow "[+]If it doesn't move on for a while, give it a try!"
+    Write-Host -ForegroundColor Yellow "[+]Someone figure out how to make this not happen and I will give you a cookie" 
     
     ArpCache
     DLLSearchOrderHijacking
@@ -2039,15 +1702,14 @@ function Meta-Blue {
     Drivers
     BITSJobs
     HistoricalFirewallChanges
+    CapabilityAccessManager
     #ProgramData
     DLLs
-    #Steal-Prefetch
     #Update-Sysmon
     #Find-File
     TearDown-Sessions
     WaitFor-Jobs
     Shipto-Splunk
-    #Find-Tiltwheel
     cd $Home\desktop
          
 }
