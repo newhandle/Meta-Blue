@@ -11,31 +11,35 @@
     Author         : newhandle
     Prerequisite   : PowerShell
     Created        : 1 Oct 18
-    Change Date    : June 7th 2020
+    Change Date    : Aug 7th 2020
     
 #>
 
 $timestamp = (get-date).Tostring("yyyy_MM_dd_hh_mm_ss")
 
-Set-Item WSMan:\localhost\Shell\MaxShellsPerUser -Value 10000
-Set-Item WSMan:\localhost\Plugin\microsoft.powershell\Quotas\MaxShellsPerUser -Value 10000
-Set-Item WSMan:\localhost\Plugin\microsoft.powershell\Quotas\MaxShells -Value 10000
-
 <#
     Define the root directory for results. CHANGE THIS TO BE WHEREVER YOU WANT.
 #>
-$outFolder = "C:\Meta-Blue\$timestamp"
+$metaBlueFolder = "C:\Meta-Blue\"
+$outFolder = "$metaBlueFolder\$timestamp"
+#$outFolder = "$home\desktop\collection\$timestamp"
 $rawFolder = "$outFolder\raw"
-$jsonFolder = "C:\MetaBlue Results"
+$anomaliesFolder = "$outFolder\Anomalies"
+#$jsonFolder = "C:\MetaBlue Results"
+$excludedHostsFile = "C:\Meta-Blue\ExcludedHosts.csv"
 
-if(!(test-path $outFolder)){
-    new-item -itemtype directory -path $outFolder -Force
-}
-if(!(test-path $rawFolder)){
-    new-item -itemtype directory -path $rawFolder -Force
-}
-if(!(test-path $jsonFolder)){
-    new-item -itemtype directory -path $jsonFolder -Force
+function Build-Directories{
+    if(!(test-path $outFolder)){
+        new-item -itemtype directory -path $outFolder -Force
+    }
+    if(!(test-path $rawFolder)){
+        new-item -itemtype directory -path $rawFolder -Force
+    }if(!(test-path $anomaliesFolder)){
+        new-item -itemtype directory -path $anomaliesFolder -Force
+    }
+    <#if(!(test-path $jsonFolder)){
+        new-item -itemtype directory -path $jsonFolder -Force
+    }#>
 }
 
 $adEnumeration = $false
@@ -44,8 +48,10 @@ $localBox = $false
 $waitForJobs = ""
 $runningJobThreshold = 5
 $jobTimeOutThreshold = 20
+$isRanAsSchedTask = $false
 
 $nodeList = [System.Collections.ArrayList]@()
+
 
 <#
     This function will convert a folder of csvs to json.
@@ -107,6 +113,68 @@ function Repair-PSSessions{
     Get-PSSession | ?{$_.state -eq "Broken"} | Remove-PSSession 
 }
 
+<#
+    https://www.powershellgallery.com/packages/Binary-Search-WExample/1.0.1/Content/Binary-Search-WExample.ps1
+#>
+Function Binary-Search {
+[CmdletBinding()]
+
+Param (
+    [Parameter(Mandatory=$True)
+    ]
+
+    $InputArray,
+    $SearchVal,
+    $Attribute)   #End Param
+
+#==============Begin Main Function============================
+#$InputArray = $InputArray |sort $Attribute #remove # if the input array was not sorted before calling the function
+#write-host "SearchVal is: "$Searchval
+#write-host "Attribute is: "$Attribute
+$LowIndex = 0                              #Low side of array segment
+$Counter = 0
+$TempVal = ""                              #Used to determine end of search where $Found = $False
+$HighIndex = $InputArray.count             #High Side of array segment
+[int]$MidPoint = ($HighIndex-$LowIndex)/2  #Mid point of array segment
+#write-host "Midpoint is: $midPoint Searchval is: $Searchval"
+$Global:Found = $False
+
+
+While($LowIndex -le $HighIndex){
+    $MidVal = $InputArray[$MidPoint].$Attribute   
+                                                
+    If($TempVal -eq $MidVal){              #If identical, the search has completed and $Found = $False
+        $Global:Found = $False
+        Return
+    }
+    else{
+        $TempVal = $MidVal                 #Update the TempVal. Search continues.
+    }
+    
+#write-host "Midval is: $midval"
+    #Write-host "Low is $lowindex, Mid is $midpoint, High is $HighIndex"
+    #read-host
+        If($SearchVal -lt $MidVal) {
+            #write-host "SV < MV"
+            $Counter++
+            $HighIndex = $MidPoint 
+            [int]$MidPoint = (($HighIndex-$LowIndex)/ 2 +$LowIndex)
+            }
+        If($SearchVal -gt $MidVal) {
+            #write-host "SV > MV"
+            $Counter++
+            $LowIndex = $MidPoint 
+            [int]$MidPoint = ($MidPoint+(($HighIndex - $MidPoint) / 2))         
+            }
+        If($SearchVal -eq $MidVal) {
+            $Global:Found = $True 
+            #write-host "User $Midval was found. It took $Counter passes"
+            
+            Return $midpoint
+            }
+}   #End While
+}   #End Function
+
 function Create-Artifact{
 <#
     There are two ways to use Create-Artifact. The first way, stores all information on a computer by 
@@ -123,6 +191,7 @@ function Create-Artifact{
 
             $time = (Get-date)
             $elapsed = ($time - $job.PSBeginTime).minutes
+            #write-host "Elapsed:" $elapsed
             
             if(($job.state -eq "completed")){
 
@@ -138,13 +207,13 @@ function Create-Artifact{
                     $OS = ($nodeList |?{$_.hostname -eq $ComputerName.toUpper()}).operatingsystem
                     if(($OS -like "*pro*") -or ($OS -like "*Enterprise*")){
                     #if($windowsHosts.contains($computername.toUpper())){
-                        Receive-Job $job.id | export-csv -force -append -NoTypeInformation -path "$rawFolder\Host $Task.csv" | out-null
+                        Receive-Job $job.id | export-csv -force -append -NoTypeInformation -path "$rawFolder\Host_$Task.csv" | out-null
                     }
                     elseif($OS -like "*Server*"){
                     #elseif($windowsServers.Contains($ComputerName.toUpper())){
-                        Receive-Job $job.id | export-csv -force -append -NoTypeInformation -path "$rawFolder\Server $Task.csv" | out-null
+                        Receive-Job $job.id | export-csv -force -append -NoTypeInformation -path "$rawFolder\Server_$Task.csv" | out-null
                     }else{
-                        Receive-Job $job.id | export-csv -force -append -NoTypeInformation -path "$rawFolder\Unknown $Task.csv" | out-null
+                        Receive-Job $job.id | export-csv -force -append -NoTypeInformation -path "$rawFolder\Unknown_$Task.csv" | out-null
                     }
                 #This is for prefetch.
                 }
@@ -167,7 +236,8 @@ function Create-Artifact{
 
             }
             elseif(($elapsed -ge $jobTimeOutThreshold) -and ($job.state -ne "Completed")){
-                $job | stop-job
+                $job | export-csv -Append -NoTypeInformation "$outFolder\failedjobs.csv"
+                Remove-Job $job.id -force
             }
             elseif($job.state -eq "Running"){
                 continue
@@ -303,18 +373,19 @@ while ($FirstHost -lt $LastHost) {
    return $IPSubnetList
 }
 
-
 function Enumerator([System.Collections.ArrayList]$iparray){
 <#
     TODO: We need to add a method for determining windows hosts past ICMP. 
     we can test-netconnection -port 135 and test-netconnection -commontcpport smb
-    TODO: For everything that is left after that, banner grab 22 because  that should help
+    TODO: For everything that is left after that, banner grab 22 because that should help
     identify linux devices.
     TODO: Past that, consult something else.
 #>
 <#
     Enumerator asynchronously pings and asynchronously performs DNS name resolution.
 #>
+    Build-Directories
+
     if($adEnumeration){
         Write-host -ForegroundColor Green "[+]Checking Windows OS Type"
    
@@ -323,7 +394,7 @@ function Enumerator([System.Collections.ArrayList]$iparray){
                     (Invoke-Command -ComputerName $i -ScriptBlock  {(gwmi win32_operatingsystem).caption} -AsJob -JobName $i) | out-null               
                     }
                 }get-job | wait-job | out-null
-       }
+    }
     else{
         <#
             Asynchronously Ping
@@ -333,25 +404,32 @@ function Enumerator([System.Collections.ArrayList]$iparray){
         }[threading.tasks.task]::WaitAll($task)
 
         
-        $addresses = foreach($i in $task.result){($i.address).Ipaddresstostring}
-        
-        $addresses = ($addresses |group |select count,name |sort count).name | ?{$_ -ne "0.0.0.0"}
-
         $result = $task.Result
-        $result = $result | ?{$_.status -eq "Success"}
+        
+        $result = $result | ?{($_.status -eq "Success") -and ($_.address -ne "0.0.0.0") -and ($iparray.Contains($_.Address.IPAddressToString))}
+        
+        $duplicateIp = [System.Collections.ArrayList]@()
         foreach($i in $result){
-            $nodeObj = [PSCustomObject]@{
-                HostName = ""
-                IPAddress = ""
-                OperatingSystem = ""
-                TTL = 0
+            if(!$duplicateIp.Contains($i.Address.IPAddressToString)){
+
+                $duplicateIp.add($i.Address.IPAddressToString) | out-null
+                
+                $nodeObj = [PSCustomObject]@{
+                    HostName = ""
+                    IPAddress = ""
+                    OperatingSystem = ""
+                    TTL = 0
+                }
+                
+                $nodeObj.IPAddress = $i.Address.IPAddressToString
+                
+                $nodeObj.TTL = $i.Options.ttl
+            
+                $nodeList.Add($nodeObj) | Out-Null
             }
-            $nodeObj.IPAddress = $i.Address.IPAddressToString
-            $nodeObj.TTL = $i.Options.ttl
-            $nodeList.Add($nodeObj) | Out-Null
         }
 
-        write-host -ForegroundColor Green "[+]There are" ($result | measure).count "total live hosts."
+        write-host -ForegroundColor Green "[+]There are" ($nodeList | measure).count "total live hosts."
 
         foreach($i in $nodeList){
             $ttl = $i.ttl
@@ -371,25 +449,27 @@ function Enumerator([System.Collections.ArrayList]$iparray){
         <#
             Asynchronously Resolve DNS Names
         #>
-        $dnsTask = foreach($i in $addresses){
-                    [system.net.dns]::GetHostEntryAsync($i)
+        
+        $dnsTask = foreach($i in $nodeList){
+                    [system.net.dns]::GetHostEntryAsync($i.ipaddress)
                     
         }[threading.tasks.task]::WaitAll($dnsTask) | out-null
 
         $dnsTask = $dnsTask | ?{$_.status -ne "Faulted"}
 
+        $nodelist = $nodelist | sort ipaddress
+        
         foreach($i in $dnsTask){
-            foreach($j in $nodeList){
-                $hostname = (($i.result.hostname).split('.')[0]).toUpper()
-                $ip = ($i.result.addresslist.Ipaddresstostring)
-                if($ip -ne $null -and $hostname -ne $Null){
-                    if($ip -eq $j.ipaddress){
-                        $j.hostname = $hostname
-                    }
+            $hostname = (($i.result.hostname).split('.')[0]).toUpper()
+            $ip = ($i.result.addresslist.Ipaddresstostring)
+            if(($ip -ne $null) -and ($hostname -ne $Null) -and ($ip -ne "") -and ($hostname -ne "")){
+                $index = Binary-Search $nodeList $ip ipaddress
+                if(($index -ne "") -and ($index -ne $null)){
+                    $nodeList[$index].hostname = $hostname
                 }
             }
+            
         }
-
             
         Write-Host -ForegroundColor Green "[+]Reverse DNS Resolution Complete"   
 
@@ -399,7 +479,11 @@ function Enumerator([System.Collections.ArrayList]$iparray){
             if(($i.operatingsystem -eq "Windows")){
                 $comp = $i.ipaddress
                 Write-Host -ForegroundColor Green "Starting OS ID Job on:" $comp
-                Start-Job -Name $comp -ScriptBlock {gwmi win32_operatingsystem -ComputerName $using:comp -ErrorAction SilentlyContinue}|Out-Null
+                if(($i.hostname -ne "") -and ($i.hostname -ne $null)){
+                    #Start-Job -Name $comp -ScriptBlock {gwmi win32_operatingsystem -ComputerName $using:comp -ErrorAction SilentlyContinue}|Out-Null
+                    
+                    Invoke-Command -ComputerName $i.hostname -ScriptBlock {gwmi win32_operatingsystem -ErrorAction SilentlyContinue} -AsJob -JobName $comp | out-null
+                }
             }
         }
         
@@ -417,7 +501,7 @@ function Enumerator([System.Collections.ArrayList]$iparray){
 
                  $osinfo = Receive-Job $job -ErrorAction SilentlyContinue
                  remove-job $job
-                 if($osinfo -ne $null){
+                 if(($osinfo -ne $null) -and ($osinfo -ne "") -and ($osinfo.csname -ne "") -and ($osinfo.csname -ne $null)){
 
                     $hostname = (($osinfo.CSName).split('.')[0]).toUpper()
                     
@@ -528,30 +612,6 @@ function AccessibilityFeature{
     }
 }
 
-function InstalledSoftware{
-    Write-host "Starting InstalledSoftware Jobs"
-    if($localBox){
-        $(Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*; 
-        Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*;
-        New-PSDrive -Name HKU -PSProvider Registry -Root Registry::HKEY_USERS| Out-Null;
-        $UserInstalls += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
-        $(foreach ($User in $UserInstalls){Get-ItemProperty HKU:\$User\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*});
-        $UserInstalls = $null;try{Remove-PSDrive -Name HKU}catch{};)|where {($_.DisplayName -ne $null) -and ($_.Publisher -ne $null)} | export-csv -NoTypeInformation -Append "$outFolder\Local InstalledSoftware.csv" | Out-Null
-    }else{    
-        foreach($i in (Get-PSSession)){           
-            (Invoke-Command -session $i -ScriptBlock  {
-                $(Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*; 
-                Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*;
-                New-PSDrive -Name HKU -PSProvider Registry -Root Registry::HKEY_USERS| Out-Null;
-                $UserInstalls += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
-                $(foreach ($User in $UserInstalls){Get-ItemProperty HKU:\$User\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*});
-                $UserInstalls = $null;try{Remove-PSDrive -Name HKU}catch{};)|where {($_.DisplayName -ne $null) -and ($_.Publisher -ne $null)}
-            }  -asjob -jobname "InstalledSoftware") | out-null
-        }
-        Create-Artifact
-    }
-}
-
 <#
     MITRE ATT&CK: T1100
 #>
@@ -577,7 +637,7 @@ function Processes{
         gwmi win32_process | export-csv -NoTypeInformation -Append "$outFolder\Local Processes.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
-            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_process}  -asjob -jobname "Processes") | out-null
+            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_process | Select-Object -Property processname,handles,path.pscomputernamename,commandline,creationdate,executablepath,parentprocessid,processid}  -asjob -jobname "Processes") | out-null
         }
         Create-Artifact
     }
@@ -589,7 +649,7 @@ function DNSCache{
         Get-DnsClientCache | export-csv -NoTypeInformation -Append "$outFolder\Local DNSCache.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
-            (Invoke-Command -session $i -ScriptBlock  {Get-DnsClientCache -ErrorAction SilentlyContinue}  -asjob -jobname "DNSCache") | out-null
+            (Invoke-Command -session $i -ScriptBlock  {Get-DnsClientCache -ErrorAction SilentlyContinue | Select-Object -Property TTL,pscomputername,data,entry,name}  -asjob -jobname "DNSCache") | out-null
         }
         Create-Artifact
     }
@@ -602,7 +662,7 @@ function ProgramData{
     
     }else{
         foreach($i in (Get-PSSession)){
-             (Invoke-Command -session $i -ScriptBlock  {Get-ChildItem -Recurse c:\ProgramData\}  -asjob -jobname "ProgramData")| out-null         
+             (Invoke-Command -session $i -ScriptBlock  {Get-ChildItem -Recurse c:\ProgramData\ | Select-Object -Property Fullname,Pscomputername,creationtimeutc,lastaccesstimeutc,attributes}  -asjob -jobname "ProgramData")| out-null         
         }
         Create-Artifact
     }
@@ -616,7 +676,7 @@ function AlternateDataStreams{
     
     }else{
         foreach($i in (Get-PSSession)){
-             (Invoke-Command -session $i -ScriptBlock  {Set-Location C:\Users; (Get-ChildItem -Recurse).fullname | Get-Item -Stream * | ?{$_.stream -ne ':$DATA'} }  -asjob -jobname "AlternateDataStreams")| out-null         
+             (Invoke-Command -session $i -ScriptBlock  {Set-Location C:\Users; (Get-ChildItem -Recurse).fullname | Get-Item -Stream * | ?{$_.stream -ne ':$DATA'} | Select-Object -Property Filename,Pscomputername,stream}  -asjob -jobname "AlternateDataStreams")| out-null         
         }
         Create-Artifact
     }
@@ -648,7 +708,7 @@ function PortMonitors{
     
     }else{
         foreach($i in (Get-PSSession)){
-             (Invoke-Command -session $i -ScriptBlock  {(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\*")}  -asjob -jobname "PortMonitors")| out-null         
+             (Invoke-Command -session $i -ScriptBlock  {(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\*") | Select-Object -Property Driver,Pschildname,pscomputername}  -asjob -jobname "PortMonitors")| out-null         
         }
         Create-Artifact
     }
@@ -681,7 +741,10 @@ function DLLSearchOrderHijacking{
     
     }else{
         foreach($i in (Get-PSSession)){
-             (Invoke-Command -session $i -ScriptBlock  {}  -asjob -jobname "DLLSearchOrderHijacking")| out-null         
+             (Invoke-Command -session $i -ScriptBlock  {
+                (gci -path C:\Windows\System32\* -include *.dll | Get-AuthenticodeSignature | Where-Object Status -NE "Valid");
+                (gci -path C:\Windows\* -include *.dll | Get-AuthenticodeSignature | Where-Object Status -NE "Valid")
+             }  -asjob -jobname "DLLSearchOrderHijacking")| out-null         
         }
         Create-Artifact
     }
@@ -697,7 +760,7 @@ function BITSJobs{
     
     }else{
         foreach($i in (Get-PSSession)){
-             (Invoke-Command -session $i -ScriptBlock  {Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Bits-Client/Operational'; Id='59'} }  -asjob -jobname "BITSJobs")| out-null         
+             (Invoke-Command -session $i -ScriptBlock  {Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Bits-Client/Operational'; Id='59'} | Select-Object -Property message,pscomputername,id,logname,processid,userid,timecreated}  -asjob -jobname "BITSJobs")| out-null         
         }
         Create-Artifact
     }
@@ -713,24 +776,89 @@ function SystemFirmware{
     
     }else{
         foreach($i in (Get-PSSession)){
-             (Invoke-Command -session $i -ScriptBlock  {Get-WmiObject win32_bios}  -asjob -jobname "SystemFirmware")| out-null         
+             (Invoke-Command -session $i -ScriptBlock  {Get-WmiObject win32_bios | Select-Object -Property pscomputername,biosversion,caption,currentlanguage,manufacturer,name,serialnumber}  -asjob -jobname "SystemFirmware")| out-null         
         }
         Create-Artifact
     }
 }
 
-function LogonScripts{
-    Write-host "Starting LogonScripts Enum"
+<#
+    T1037.001
+#>
+function UserInitMprLogonScript{
+    Write-host "Starting UserInitMprLogonScript Enum"
+
     if($localBox){
-    
+        $logonScriptsArrayList = [System.Collections.ArrayList]@();
+                 
+                 New-PSDrive HKU Registry HKEY_USERS -ErrorAction SilentlyContinue | Out-Null;
+                 Set-Location HKU: | Out-Null;
+
+                 $SIDS  += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
+
+                 foreach($SID in $SIDS){
+                    $logonscriptObject = [PSCustomObject]@{
+                        SID =""
+                        HasLogonScripts = ""
+                 
+                    };
+                    $logonscriptObject.sid = $SID; 
+                    $logonscriptObject.haslogonscripts = !((Get-ItemProperty HKU:\$SID\Environment\).userinitmprlogonscript -eq $null); 
+                    $logonScriptsArrayList.add($logonscriptObject) | out-null
+                    }
+                    $logonScriptsArrayList | export-csv -NoTypeInformation -Append "$outFolder\Local_UserInitMprLogonScript.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {
+                 $logonScriptsArrayList = [System.Collections.ArrayList]@();
+                 
                  New-PSDrive HKU Registry HKEY_USERS -ErrorAction SilentlyContinue | Out-Null;
                  Set-Location HKU: | Out-Null;
-                 (Get-ChildItem -ErrorAction SilentlyContinue| %{test-path "$($_.name)\Environment\UserInitMprLogonScript"})   
+
+                 $SIDS  += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
+
+                 foreach($SID in $SIDS){
+                    $logonscriptObject = [PSCustomObject]@{
+                        SID =""
+                        HasLogonScripts = ""
+                 
+                    };
+                    $logonscriptObject.sid = $SID; 
+                    $logonscriptObject.haslogonscripts = !((Get-ItemProperty HKU:\$SID\Environment\).userinitmprlogonscript -eq $null); 
+                    $logonScriptsArrayList.add($logonscriptObject) | out-null
+                    }
+                    $logonScriptsArrayList
+                 
              
-             }  -asjob -jobname "LogonScripts")| out-null         
+             }  -asjob -jobname "UserInitMprLogonScript")| out-null         
+        }
+        Create-Artifact
+    }
+}
+
+function InstalledSoftware{
+    Write-host "Starting InstalledSoftware Jobs"
+    if($localBox){
+        $(Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*; 
+        Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*;
+        if(!(test-path HKU:)){
+            New-PSDrive -Name HKU -PSProvider Registry -Root Registry::HKEY_USERS| Out-Null;
+        }
+        $UserInstalls += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
+        $(foreach ($User in $UserInstalls){Get-ItemProperty HKU:\$User\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*});
+        $UserInstalls = $null;try{Remove-PSDrive -Name HKU}catch{};)|where {($_.DisplayName -ne $null) -and ($_.Publisher -ne $null)} | export-csv -NoTypeInformation -Append "$outFolder\Local InstalledSoftware.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock  {
+                $(Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*; 
+                Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*;
+                if(!(test-path HKU:)){
+                    New-PSDrive -Name HKU -PSProvider Registry -Root Registry::HKEY_USERS| Out-Null;
+                }
+                $UserInstalls += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
+                $(foreach ($User in $UserInstalls){Get-ItemProperty HKU:\$User\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*});
+                $UserInstalls = $null;try{Remove-PSDrive -Name HKU}catch{};)|where {($_.DisplayName -ne $null) -and ($_.Publisher -ne $null)}
+            }  -asjob -jobname "InstalledSoftware") | out-null
         }
         Create-Artifact
     }
@@ -745,13 +873,13 @@ function Registry{
 #>
     Write-host "Starting Registry Jobs"
 
-    New-PSDrive HKU Registry HKEY_USERS
+    if(!(test-path HKU:)){
+        New-PSDrive HKU Registry HKEY_USERS
+    }
     Set-Location HKU:
 
     if($localBox){
-        $logonScripts = @()
-
-        foreach($i in (Get-ChildItem).name){if(test-path "$i\Environment\UserInitMprLogonScript"){$logonScripts += [String]$i}}
+        
 
         $registry = [PSCustomObject]@{
                 
@@ -760,7 +888,7 @@ function Registry{
                 #>
                 AppCertDLLs = (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\appcertdlls\')
 
-                LogonScripts = [String]$logonScripts
+                
 
                 BootShell = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\' -ErrorAction SilentlyContinue).bootshell
 
@@ -796,9 +924,8 @@ function Registry{
             $registry | Export-Csv -NoTypeInformation -Append "$outFolder\Local Registry.csv"
     }else{
         foreach($i in (Get-PSSession)){           
-            (Invoke-Command -session $i -ScriptBlock  {                
-                New-PSDrive HKU Registry HKEY_USERS -ErrorAction SilentlyContinue | Out-Null;
-                Set-Location HKU: | Out-Null;
+            (Invoke-Command -session $i -ScriptBlock  {  
+                
 
                 $registry = [PSCustomObject]@{
                     
@@ -806,8 +933,6 @@ function Registry{
                         MITRE ATT&CK: T1182
                     #>
                     AppCertDLLs = (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\appcertdlls\')
-
-                    LogonScripts = [String](Get-ChildItem | %{test-path "$($_.name)\Environment\UserInitMprLogonScript"})
 
                     BootShell = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\' -ErrorAction SilentlyContinue).bootshell
 
@@ -851,10 +976,10 @@ function Registry{
 function AVProduct{
     Write-host "Starting AVProduct Jobs"
     if($localBox){
-       Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct -ErrorAction SilentlyContinue | Export-Csv -NoTypeInformation -Append "$outFolder\Local AVProduct.csv" | out-null
+       Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct -ErrorAction SilentlyContinue | select PSComputerName,displayName,pathToSignedProductExe,pathToSignedReportingExe | Export-Csv -NoTypeInformation -Append "$outFolder\Local AVProduct.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){           
-            (Invoke-Command -session $i -ScriptBlock  {Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct -ErrorAction SilentlyContinue}  -asjob -jobname "AVProduct") | out-null
+            (Invoke-Command -session $i -ScriptBlock  {Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct -ErrorAction SilentlyContinue | select PSComputerName,displayName,pathToSignedProductExe,pathToSignedReportingExe}  -asjob -jobname "AVProduct") | out-null
         }
         Create-Artifact
     }
@@ -867,7 +992,7 @@ function Services{
         gwmi win32_service | export-csv -NoTypeInformation -Append "$outFolder\Local Services.csv" | Out-Null
     }else{ 
         foreach($i in (Get-PSSession)){         
-            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_service}  -asjob -jobname "Services")| out-null
+            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_service | Select-Object -Property PSComputerName,caption,description,pathname,processid,startname,state}  -asjob -jobname "Services")| out-null
         }
         Create-Artifact
     }
@@ -879,7 +1004,7 @@ function PoshVersion{
         Get-WindowsOptionalFeature -Online -FeatureName microsoftwindowspowershellv2 | export-csv -NoTypeInformation -Append "$outFolder\Local PoshVersion.csv" | Out-Null
     }else{ 
         foreach($i in (Get-PSSession)){         
-            (Invoke-Command -session $i -ScriptBlock  {Get-WindowsOptionalFeature -Online -FeatureName microsoftwindowspowershellv2}  -asjob -jobname "PoshVersion")| out-null
+            (Invoke-Command -session $i -ScriptBlock  {Get-WindowsOptionalFeature -Online -FeatureName microsoftwindowspowershellv2 | Select-Object -Property PSComputerName,FeatureName,State,LogPath}  -asjob -jobname "PoshVersion")| out-null
         }
         Create-Artifact
     }
@@ -891,7 +1016,7 @@ function Startup{
         gwmi win32_startupcommand | export-csv -NoTypeInformation -Append "$outFolder\Local Startup.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){   
-            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_startupcommand}  -asjob -jobname "Startup")| out-null         
+            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_startupcommand | Select-Object -Property PSComputerName,Caption,Command,Description,Location,User}  -asjob -jobname "Startup")| out-null         
         }
         Create-Artifact
     }
@@ -903,13 +1028,13 @@ function Startup{
 function StartupFolder{
     Write-host "Starting StartupFolder Jobs"
     if($localBox){
-        gci -path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*" -include *.lnk,*.url -ErrorAction SilentlyContinue | export-csv -NoTypeInformation -Append "$outFolder\Local StartupFolder.csv" | out-null
-        gci -path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" -include *.lnk,*.url -ErrorAction SilentlyContinue | export-csv -NoTypeInformation -Append "$outFolder\Local StartupFolder.csv" | out-null
+        gci -path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*" <#-include *.lnk,*.url#> -ErrorAction SilentlyContinue | export-csv -NoTypeInformation -Append "$outFolder\Local StartupFolder.csv" | out-null
+        gci -path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" <#-include *.lnk,*.url#> -ErrorAction SilentlyContinue | export-csv -NoTypeInformation -Append "$outFolder\Local StartupFolder.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){   
             (Invoke-Command -session $i -ScriptBlock  {
-                gci -path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*" -include *.lnk,*.url -ErrorAction SilentlyContinue;
-                gci -path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" -include *.lnk,*.url -ErrorAction SilentlyContinue
+                gci -path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*"<# -include *.lnk,*.url#> -ErrorAction SilentlyContinue| Select-Object -Property PSComputerName,Length,FullName,Extension,CreationTime,LastAccessTime;
+                gci -path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" <#-include *.lnk,*.url#> -ErrorAction SilentlyContinue | Select-Object -Property PSComputerName,Length,FullName,Extension,CreationTime,LastAccessTime
             }  -asjob -jobname "StartupFolder")| out-null         
         }
         Create-Artifact
@@ -922,7 +1047,7 @@ function Drivers{
         gwmi win32_systemdriver | export-csv -NoTypeInformation -Append "$outFolder\Local Drivers.csv" | Out-Null
     }else{ 
         foreach($i in (Get-PSSession)){         
-            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_systemdriver}  -asjob -jobname "Drivers")| out-null         
+            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_systemdriver | Select-Object -Property PSComputerName,caption,description,name,pathname,started,startmode,state}  -asjob -jobname "Drivers")| out-null         
         }
         Create-Artifact
     }
@@ -951,10 +1076,10 @@ function DriverHash{
 function EnvironVars{
     Write-host "Starting EnvironVars Jobs"
     if($localBox){
-        gwmi win32_environment | export-csv -NoTypeInformation -Append "$outFolder\Local EnvironVars.csv" | Out-Null
+        gwmi win32_environment|?{$_.name -ne "OneDrive"} | export-csv -NoTypeInformation -Append "$outFolder\Local EnvironVars.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){         
-            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_environment}  -asjob -jobname "EnvironVars")| out-null         
+            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_environment |?{$_.name -ne "OneDrive"} | Select-Object -Property PSComputerName,name,description,username,variablevalue}  -asjob -jobname "EnvironVars")| out-null         
         }
         Create-Artifact
     }  
@@ -966,7 +1091,7 @@ function NetAdapters{
         gwmi win32_networkadapterconfiguration | Export-Csv -NoTypeInformation -Append "$outFolder\Local NetAdapters.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){         
-            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_networkadapterconfiguration}  -asjob -jobname "NetAdapters")| out-null        
+            (Invoke-Command -session $i -ScriptBlock  {gwmi win32_networkadapterconfiguration | Select-Object -Property PSComputerName,Description,IPAddress,IPSubnet,MACAddress,servicename}  -asjob -jobname "NetAdapters")| out-null        
         }
         Create-Artifact
     }
@@ -978,7 +1103,7 @@ function SystemInfo{
         gwmi win32_computersystem | export-csv -NoTypeInformation -Append "$outFolder\Local Systeminfo.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){
-             (Invoke-Command -session $i -ScriptBlock  {gwmi win32_computersystem}  -asjob -jobname "SystemInfo")| out-null         
+             (Invoke-Command -session $i -ScriptBlock  {gwmi win32_computersystem | Select-Object -Property PSComputerName,domain,manufacturer,model,primaryownername,totalphysicalmemory,username}  -asjob -jobname "SystemInfo")| out-null         
         }
         Create-Artifact
     }
@@ -1253,6 +1378,72 @@ function ArpCache{
     }
 }
 
+<#
+    T1050
+#>
+function NewlyRegisteredServices{
+    Write-host "Starting NewlyRegisteredServices Jobs"
+    if($localBox){
+       Get-WinEvent -FilterHashtable @{ LogName='System'; Id='7045';} | select timecreated,message | Export-Csv -NoTypeInformation -Append "$outFolder\Local_NewlyRegisteredServices.csv" | out-null
+    
+    }else{
+        foreach($i in (Get-PSSession)){
+             (Invoke-Command -session $i -ScriptBlock  { Get-WinEvent -FilterHashtable @{ LogName='System'; Id='7045';} | select timecreated,message}  -asjob -jobname "NewlyRegisteredServices")| out-null         
+        }
+        Create-Artifact
+    }
+}
+
+<#
+    T1546.013
+#>
+function PowershellProfile{
+    Write-host "Starting PowershellProfile Jobs"
+    if($localBox){
+        test-path "$pshome\profile.ps1" | Export-Csv -NoTypeInformation -Append "$outFolder\Local_PowershellProfile.csv" | out-null
+        test-path "$pshome\microsoft.*.ps1" | Export-Csv -NoTypeInformation -Append "$outFolder\Local_PowershellProfile.csv" | out-null
+        test-path "c:\users\*\My Documents\powershell\Profile.ps1" | Export-Csv -NoTypeInformation -Append "$outFolder\Local_PowershellProfile.csv" | out-null
+        test-path "C:\Users\*\My Documents\microsoft.*.ps1"| Export-Csv -NoTypeInformation -Append "$outFolder\Local_PowershellProfile.csv" | out-null
+    
+    }else{
+        foreach($i in (Get-PSSession)){
+             (Invoke-Command -session $i -ScriptBlock  {
+                test-path $pshome\profile.ps1
+                test-path $pshome\microsoft.*.ps1
+                test-path "c:\users\*\My Documents\powershell\Profile.ps1"
+                test-path "C:\Users\*\My Documents\microsoft.*.ps1"
+             
+             }  -asjob -jobname "PowershellProfile")| out-null         
+        }
+        Create-Artifact
+    }
+}
+
+function UACBypassFodHelper{
+    Write-host "Starting UACBypassFodHelper Jobs"
+    if($localBox){
+        if(!(test-path HKU:)){
+            New-PSDrive -Name HKU -PSProvider Registry -Root Registry::HKEY_USERS| Out-Null;
+        }
+        $UserInstalls += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
+        foreach($user in $UserInstalls){
+            Get-ItemProperty HKU:\$User\SOFTWARE\classes\ms-settings-shell\open\command -ErrorAction SilentlyContinue| Export-Csv -NoTypeInformation -Append "$outFolder\Local_UACBypassFodHelper.csv" | out-null
+        }
+    }else{
+        foreach($i in (Get-PSSession)){
+             (Invoke-Command -session $i -ScriptBlock  {
+                $UserInstalls += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
+                foreach($user in $UserInstalls){
+                    if(test-path HKU\$user\Software\Classes\ms-settings\shell\open\command){
+                        Get-ItemProperty HKU:\$User\SOFTWARE\classes\ms-settings-shell\open\command -ErrorAction SilentlyContinue
+                    }
+                }
+             
+             }  -asjob -jobname "UACBypassFodHelper")| out-null         
+        }
+        Create-Artifact
+    }
+}
 
 function Update-Sysmon{
 <#
@@ -1279,7 +1470,6 @@ function Update-Sysmon{
         }while($true)
     }
 }
-
 
 function Find-File{
     if(!$localBox){
@@ -1315,12 +1505,16 @@ function Retry-FailedJobs{}
 
 function TearDown-Sessions{
     if(!$localBox){
-        do{
+        if($isRanAsSchedTask -eq $true){
+            Remove-PSSession * | out-null
+            return $true
+        }else{
+            do{
             $sessions = Read-Host "Do you want to tear down the PSSessions?(y/n)"
 
             if($sessions -ieq 'y'){
-                Remove-PSSession * | out-null
-                return $true
+                    Remove-PSSession * | out-null
+                    return $true
             }elseif($sessions -ieq 'n'){
                 return $false
             }
@@ -1328,12 +1522,18 @@ function TearDown-Sessions{
                 Write-Host "Not a valid option"
             }
         }while($true)
+        }
+        
     }
 }
 
-
 function Build-Sessions{
     if(!$localBox){
+        $excludedHosts = @()
+
+        Set-Item WSMan:\localhost\Shell\MaxShellsPerUser -Value 10000
+        Set-Item WSMan:\localhost\Plugin\microsoft.powershell\Quotas\MaxShellsPerUser -Value 10000
+        Set-Item WSMan:\localhost\Plugin\microsoft.powershell\Quotas\MaxShells -Value 10000
         <#
             Clean up and broken PSSessions.
         #>
@@ -1343,13 +1543,17 @@ function Build-Sessions{
         }
         $activeSessions = (Get-PSSession | ?{$_.State -eq "Opened"}).ComputerName
 
+        if(test-path $excludedHostsFile){
+            $excludedHosts = import-csv $excludedHostsFile
+        }
+
         <#
             Create PSSessions
         #>
         foreach($i in $nodeList){
             if($activeSessions -ne $null){
                 if(!$activeSessions.Contains($i.hostname)){
-                    if(($i.hostname -ne "") -and ($i.operatingsystem -like "*Windows*")){
+                    if(($i.hostname -ne "") -and ($i.operatingsystem -like "*Windows*") -and (!$excludedHosts.hostname.Contains($i.hostname))){
                         Write-host "Starting PSSession on" $i.hostname
                         New-pssession -computername $i.hostname -name $i.hostname -SessionOption (New-PSSessionOption -NoMachineProfile -MaxConnectionRetryCount 5) -ThrottleLimit 100| out-null
                     }
@@ -1357,7 +1561,7 @@ function Build-Sessions{
                     Write-host "PSSession already exists:" $i.hostname -ForegroundColor Red
                 }
             }else{
-                if(($i.hostname -ne "") -and ($i.operatingsystem -like "*windows*")){
+                if(($i.hostname -ne "") -and ($i.operatingsystem -like "*windows*") -and (!$excludedHosts.hostname.Contains($i.hostname))){
                     Write-host "Starting PSSession on" $i.hostname
                     New-pssession -computername $i.hostname -name $i.hostname -SessionOption (New-PSSessionOption -NoMachineProfile -MaxConnectionRetryCount 5) -ThrottleLimit 100| out-null
                 }
@@ -1625,6 +1829,34 @@ function HistoricalFirewallChanges{
 
 }
 
+function PortProxy{
+    
+    Write-host "Starting PortProxy Jobs"
+    if($localBox){
+         
+    }else{    
+        foreach($i in (Get-PSSession)){           
+           (Invoke-Command -session $i -ScriptBlock{
+                $portproxyResults = (netsh interface portproxy show all);
+                $portproxyarraylist = [System.Collections.ArrayList]@();
+                if((($portproxyResults.gettype()).basetype.name -eq "Array") -and ($portproxyResults.count -gt 0)){
+                    for($i = 5; $i -lt ($portproxyResults.Length); $i++){
+                        $portproxyObject = [PSCustomObject]@{
+                            proxy = ""
+                        }
+                        $portproxyObject.proxy = $portproxyResults[$i]
+
+                        $portproxyarraylist.Add($portproxyObject) | Out-Null
+                    }
+                    $portproxyarraylist
+                }
+                                 
+            } -asjob -jobname "PortProxy") | out-null
+        }
+        Create-Artifact
+    }
+}
+
 function CapabilityAccessManager{
     
     Write-host "Starting CapabilityAccessManager Jobs"
@@ -1639,6 +1871,211 @@ function CapabilityAccessManager{
 
 }
 
+function DnsClientServerAddress{
+    
+    Write-host "Starting DnsClientServerAddress Jobs"
+    if($localBox){
+        (get-DnsClientServerAddress) | export-csv -NoTypeInformation -Append "$outFolder\Local_DnsClientServerAddress.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock  {Get-DnsClientServerAddress}  -asjob -jobname "DnsClientServerAddress") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
+function ScheduledTaskDetails{
+    
+    Write-host "Starting ScheduledTaskDetails Jobs"
+    if($localBox){
+        ((Get-ScheduledTask).actions | ?{$_.execute -ne $null} |select execute,arguments) | export-csv -NoTypeInformation -Append "$outFolder\Local_ScheduledTaskDetails.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock  {(Get-ScheduledTask).actions | ?{$_.execute -ne $null} |select execute,arguments}  -asjob -jobname "ScheduledTaskDetails") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
+<#
+    T1023 
+#>
+function ShortcutModification{
+    
+    Write-host "Starting ShortcutModification Jobs"
+    if($localBox){
+        Select-String -Path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*.lnk" -Pattern "exe"| export-csv -NoTypeInformation -Append "$outFolder\Local_ShortcutModification.csv" | Out-Null
+        Select-String -Path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*.lnk" -Pattern "dll"| export-csv -NoTypeInformation -Append "$outFolder\Local_ShortcutModification.csv" | Out-Null
+        Select-String -Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" -Pattern "dll"| export-csv -NoTypeInformation -Append "$outFolder\Local_ShortcutModification.csv" | Out-Null
+        Select-String -Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" -Pattern "exe" | export-csv -NoTypeInformation -Append "$outFolder\Local_ShortcutModification.csv" | Out-Null
+        gci -path "C:\Users\" -recurse -include *.lnk -ea SilentlyContinue | Select-String -Pattern "exe" | export-csv -NoTypeInformation -Append "$outFolder\Local_ShortcutModification.csv" | Out-Null
+        gci -path "C:\Users\" -recurse -include *.lnk -ea SilentlyContinue | Select-String -Pattern "dll" | export-csv -NoTypeInformation -Append "$outFolder\Local_ShortcutModification.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock  {
+                Select-String -Path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*.lnk" -Pattern "exe";
+                Select-String -Path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*.lnk" -Pattern "dll";
+                Select-String -Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" -Pattern "dll";
+                Select-String -Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" -Pattern "exe";
+                gci -path "C:\Users\" -recurse -include *.lnk -ea SilentlyContinue | Select-String -Pattern "exe";
+                gci -path "C:\Users\" -recurse -include *.lnk -ea SilentlyContinue | Select-String -Pattern "dll";
+            }  -asjob -jobname "ShortcutModification") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
+function DLLSinTempDirs{
+    
+    Write-host "Starting DLLSinTempDirs Jobs"
+    if($localBox){
+        (gps -Module -ea 0).FileName|?{$_ -notlike "*system32*"}|Select-String "Appdata","ProgramData","Temp","Users","public"|unique | export-csv -NoTypeInformation -Append "$outFolder\Local_DLLSinTempDirs.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock  {(gps -Module -ea 0).FileName|?{$_ -notlike "*system32*"}|Select-String "Appdata","ProgramData","Temp","Users","public"|unique}  -asjob -jobname "DLLSinTempDirs") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
+function NamedPipes{
+    
+    Write-host "Starting NamedPipes Jobs"
+    if($localBox){
+        get-childitem \\.\pipe\ | export-csv -NoTypeInformation -Append "$outFolder\Local_NamedPipes.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock {get-childitem \\.\pipe\}  -asjob -jobname "NamedPipes") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
+<#
+    T1547.003
+#>
+function TimeProviders{
+    
+    Write-host "Starting TimeProviders Jobs"
+    if($localBox){
+         (Get-ItemProperty HKLM:\System\CurrentControlSet\Services\W32Time\TimeProviders\*) | export-csv -NoTypeInformation -Append "$outFolder\Local_TimeProviders.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock {(Get-ItemProperty HKLM:\System\CurrentControlSet\Services\W32Time\TimeProviders\*)}  -asjob -jobname "TimeProviders") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
+function RDPHistoricallyConnectedIPs{
+    
+    Write-host "Starting RDPHistoricallyConnectedIPs Jobs"
+    if($localBox){
+        Get-WinEvent -Log 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' | select -exp Properties | where {$_.Value -like '*.*.*.*' } | sort Value -u  | export-csv -NoTypeInformation -Append "$outFolder\Local_RDPHistoricallyConnectedIPs.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock {Get-WinEvent -Log 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' | select -exp Properties | where {$_.Value -like '*.*.*.*' } | sort Value -u }  -asjob -jobname "RDPHistoricallyConnectedIPs") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
+function CurveBall{
+    
+    Write-host "Starting CurveBall Jobs"
+    if($localBox){
+         Get-WinEvent -FilterHashtable @{logname="Application";id='1'} | ?{$_.providername -eq "Audit-CVE"} | export-csv -NoTypeInformation -Append "$outFolder\Local_CurveBall.csv" | Out-Null
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock {Get-WinEvent -FilterHashtable @{logname="Application";id='1'} | ?{$_.providername -eq "Audit-CVE"}}  -asjob -jobname "CurveBall") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
+function PassTheHash{
+    Write-host "Starting PassTheHash Jobs"
+    if($localBox){
+       
+    }else{
+        foreach($i in (Get-PSSession)){
+            (Invoke-Command -session $i -ScriptBlock{
+                $regexa = '.+Domain="(.+)",Name="(.+)"$';
+                $regexd = '.+LogonId="(\d+)"$';
+                $logon_users = @(Get-WmiObject win32_loggedonuser -ComputerName 'localhost');
+                if(($logon_users -ne "") -and ($logon_users -ne $null)){
+                    $session_user = @{};
+                    $logon_users |% {
+                        $_.antecedent -match $regexa > $nul;
+                        $username = $matches[1] + "\" + $matches[2];
+                        $_.dependent -match $regexd > $nul;
+                        $session = $matches[1];
+                        $sessionHex = ('0x{0:X}' -f [long]$session);
+                        $session_user[$sessionHex] += $username ;
+                    };
+
+                    $klistsarraylist = [System.Collections.ArrayList]@();
+
+                    foreach($i in $session_user.keys){
+
+                        $item = $session_user.item($i).split("\")[1]    
+
+                        $klistoutput = klist -li $i
+
+                        if($klistoutput.count -gt 7){
+        
+                            $numofrecords = $klistoutput[4].split("(")[1]
+                            $numofrecords = $numofrecords.Substring(0,$numofrecords.Length-1)        
+
+                            for($j = 0; $j -lt ($numofrecords);$j++){
+                                $klistObject = [PSCustomObject]@{
+                                                Session = ""
+                                                Username = ""
+                                                Client = ""
+                                                Server = ""
+                                                KerbTicketEncryptionType = ""
+                                                StartTime = ""
+                                                EndTime = ""
+                                                RenewTime = ""
+                                                SessionKeyType = ""
+                                                CacheFlags = ""
+                                                KdcCalled = ""
+                                            }
+
+                                    $klistObject.session = $i
+                                    $klistObject.username = $item
+                                    $klistObject.client = $klistoutput[6 + ($j * 11)].substring(12)
+                                    $klistobject.server = $klistoutput[7 + ($j * 11)].substring(9)
+                                    $klistobject.KerbTicketEncryptionType = $klistoutput[8 + ($j * 11)].substring(29)
+                                    $klistobject.StartTime = $klistoutput[10 + ($j * 11)].substring(13)
+                                    $klistobject.EndTime = $klistoutput[11 + ($j * 11)].substring(13)
+                                    $klistobject.Renewtime = $klistoutput[12 + ($j * 11)].substring(13)
+                                    $klistobject.sessionkeytype = $klistoutput[13 + ($j * 11)].substring(13)
+                                    $klistobject.cacheflags = $klistoutput[14 + ($j * 11)].substring(14)
+                                    $klistobject.kdccalled = $klistoutput[15 + ($j * 11)].substring(13)
+
+                                    $klistsarraylist.Add($klistObject) | out-null
+                            }
+                        }
+                    }
+                }
+                $klistsarraylist
+
+                }  -asjob -jobname "PassTheHash") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
 function Meta-Blue {    
     <#
         This is the data gathering portion of this script. PSSessions are created on all live windows
@@ -1646,6 +2083,7 @@ function Meta-Blue {
         output to reflect the query's actions as well as the jobname parameter. Every 3rd query or so,
         add a call to Create-Artifact. This really impacts machines with small amounts of RAM.
     #>
+    Build-Directories
     Build-Sessions
         
     <#
@@ -1657,9 +2095,15 @@ function Meta-Blue {
     Write-Host -ForegroundColor Yellow "[+]If it doesn't move on for a while, give it a try!"
     Write-Host -ForegroundColor Yellow "[+]Someone figure out how to make this not happen and I will give you a cookie" 
     
+    CurveBall
+    PortProxy
+    UACBypassFodHelper
     ArpCache
+    #PowershellProfile
+    TimeProviders
     DLLSearchOrderHijacking
     StartupFolder
+    PassTheHash
     WebShell    
     UnsignedDrivers
     VisibleWirelessNetworks
@@ -1668,7 +2112,7 @@ function Meta-Blue {
     Registry
     SMBConns
     WMIEventFilters
-    LogonScripts
+    UserInitMprLogonScript
     WMIEventConsumers
     NetshHelperDLL
     WMIEventConsumerBinds
@@ -1693,6 +2137,7 @@ function Meta-Blue {
     EnvironVars
     DriverHash
     SchedTasks
+    ScheduledTaskDetails
     PNPDevices 
     InstalledSoftware
     PrefetchListing
@@ -1703,15 +2148,37 @@ function Meta-Blue {
     BITSJobs
     HistoricalFirewallChanges
     CapabilityAccessManager
+    DnsClientServerAddress
+    NewlyRegisteredServices
+    ShortcutModification
+    DLLSinTempDirs
+    #NamedPipes
+    RDPHistoricallyConnectedIPs
     #ProgramData
-    DLLs
+    #DLLs
     #Update-Sysmon
     #Find-File
     TearDown-Sessions
     WaitFor-Jobs
-    Shipto-Splunk
-    cd $Home\desktop
+    #Shipto-Splunk
+    cd $outFolder
          
+}
+
+function Generate-IPSpaceTextFile{
+    
+    $subnets = Read-Host "How many seperate subnets are there?"
+
+    $ips = @()
+
+    for($i = 0; $i -lt $subnets; $i++){
+        $ipa = Read-Host "[$($i +1)]Please enter the network id to scan"
+        $cidr = Read-Host "[$($i +1)]Please enter the CIDR"
+        $ips += Get-SubnetRange -IPAddress $ipa -CIDR $cidr
+    }
+    $ips >> $outFolder\ipspace.txt
+    break
+
 }
 
 function Show-TitleMenu{
@@ -1723,6 +2190,7 @@ function Show-TitleMenu{
      Write-Host "3: Press '3' to audit snort rules."
      Write-Host "4: Press '4' to remotely perform dump."
      Write-Host "5: Press '5' to run Meta-Blue against the local box."
+     Write-Host "6: Press '6' to generate an IP space text file."
      Write-Host "Q: Press 'Q' to quit."
     
     $input = Read-Host "Please make a selection (title)"
@@ -1750,7 +2218,13 @@ function Show-TitleMenu{
                 Meta-Blue
                 break
            
-            }
+           }'6'{
+                Generate-IPSpaceTextFile
+                Write-Host -ForegroundColor Green "[+]File saved to $($outFolder)\ipspace.txt"
+                cd $outFolder
+                break
+           }
+
             'q' {
                 break 
            } 
@@ -1842,8 +2316,23 @@ function Show-CollectionMenu{
                             }
                             if($ptlFile -like "*.csv"){
                                 $ptlimport = import-csv $ptlFile
-                                foreach($ip in $ptlimport){$PTL.Add($ip.ipaddress) | out-null}
-                                Enumerator($PTL)
+                                foreach($node in $ptlimport){
+                                    if($node.OperatingSystem -like "*windows*"){
+                                        $nodeObj = [PSCustomObject]@{
+                                            HostName = ""
+                                            IPAddress = ""
+                                            OperatingSystem = ""
+                                            TTL = 0
+                                        }
+                                        $nodeObj.Hostname = $node.hostname
+                                        $nodeObj.IPaddress = $node.IPAddress
+                                        $nodeObj.OperatingSystem = $node.OperatingSystem
+                                        $nodeObj.TTL = $node.TTL
+                                        $nodeList.Add($node) | out-null
+                                    }
+                                }
+                                
+                                Build-Sessions
                             }if($ptlFile -like "*.txt"){
                                 $PTL = Get-Content $ptlFile
                                 Enumerator($PTL)
