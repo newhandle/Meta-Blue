@@ -11,7 +11,7 @@
     Author         : newhandle
     Prerequisite   : PowerShell
     Created        : 1 Oct 18
-    Change Date    : Aug 7th 2020
+    Change Date    : July 27th 2020
     
 #>
 
@@ -857,7 +857,7 @@ function InstalledSoftware{
                 }
                 $UserInstalls += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
                 $(foreach ($User in $UserInstalls){Get-ItemProperty HKU:\$User\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*});
-                $UserInstalls = $null;try{Remove-PSDrive -Name HKU}catch{};)|where {($_.DisplayName -ne $null) -and ($_.Publisher -ne $null)}
+                $UserInstalls = $null;)|where {($_.DisplayName -ne $null) -and ($_.Publisher -ne $null)}
             }  -asjob -jobname "InstalledSoftware") | out-null
         }
         Create-Artifact
@@ -1432,6 +1432,9 @@ function UACBypassFodHelper{
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {
+                if(!(test-path HKU:)){
+                    New-PSDrive -Name HKU -PSProvider Registry -Root Registry::HKEY_USERS| Out-Null;
+                }
                 $UserInstalls += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
                 foreach($user in $UserInstalls){
                     if(test-path HKU\$user\Software\Classes\ms-settings\shell\open\command){
@@ -1949,7 +1952,7 @@ function NamedPipes{
         get-childitem \\.\pipe\ | export-csv -NoTypeInformation -Append "$outFolder\Local_NamedPipes.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
-            (Invoke-Command -session $i -ScriptBlock {get-childitem \\.\pipe\}  -asjob -jobname "NamedPipes") | out-null
+            (Invoke-Command -session $i -ScriptBlock {get-childitem \\.\pipe\ | select fullname}  -asjob -jobname "NamedPipes") | out-null
         }
         Create-Artifact
     }
@@ -2030,7 +2033,7 @@ function PassTheHash{
 
                         $klistoutput = klist -li $i
 
-                        if($klistoutput.count -gt 7){
+                        if(($klistsarraylist -ne $null) -and ($klistoutput.count -gt 7)){
         
                             $numofrecords = $klistoutput[4].split("(")[1]
                             $numofrecords = $numofrecords.Substring(0,$numofrecords.Length-1)        
@@ -2064,6 +2067,8 @@ function PassTheHash{
 
                                     $klistsarraylist.Add($klistObject) | out-null
                             }
+                        }else{
+                            continue
                         }
                     }
                 }
@@ -2193,7 +2198,7 @@ function Show-TitleMenu{
      Write-Host "6: Press '6' to generate an IP space text file."
      Write-Host "Q: Press 'Q' to quit."
     
-    $input = Read-Host "Please make a selection (title)"
+     $input = Read-Host "Please make a selection (title)"
      switch ($input)
      {
            '1' {
