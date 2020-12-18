@@ -76,6 +76,224 @@ function Make-Json{
     
 }
 
+function Get-Exports {
+<#
+.SYNOPSIS
+Get-Exports, fetches DLL exports and optionally provides
+C++ wrapper output (idential to ExportsToC++ but without
+needing VS and a compiled binary). To do this it reads DLL
+bytes into memory and then parses them (no LoadLibraryEx).
+Because of this you can parse x32/x64 DLL's regardless of
+the bitness of PowerShell.
+
+.DESCRIPTION
+Author: Ruben Boonen (@FuzzySec)
+License: BSD 3-Clause
+Required Dependencies: None
+Optional Dependencies: None
+
+.PARAMETER DllPath
+
+Absolute path to DLL.
+
+.PARAMETER CustomDll
+
+Absolute path to output file.
+
+.EXAMPLE
+C:\PS> Get-Exports -DllPath C:\Some\Path\here.dll
+
+.EXAMPLE
+C:\PS> Get-Exports -DllPath C:\Some\Path\here.dll -ExportsToCpp C:\Some\Out\File.txt
+#>
+	param (
+        [Parameter(Mandatory = $True)]
+		[string]$DllPath,
+		[Parameter(Mandatory = $False)]
+		[string]$ExportsToCpp
+	)
+
+	Add-Type -TypeDefinition @"
+	using System;
+	using System.Diagnostics;
+	using System.Runtime.InteropServices;
+	using System.Security.Principal;
+	
+	[StructLayout(LayoutKind.Sequential)]
+	public struct IMAGE_EXPORT_DIRECTORY
+	{
+		public UInt32 Characteristics;
+		public UInt32 TimeDateStamp;
+		public UInt16 MajorVersion;
+		public UInt16 MinorVersion;
+		public UInt32 Name;
+		public UInt32 Base;
+		public UInt32 NumberOfFunctions;
+		public UInt32 NumberOfNames;
+		public UInt32 AddressOfFunctions;
+		public UInt32 AddressOfNames;
+		public UInt32 AddressOfNameOrdinals;
+	}
+	
+	[StructLayout(LayoutKind.Sequential)]
+	public struct IMAGE_SECTION_HEADER
+	{
+		public String Name;
+		public UInt32 VirtualSize;
+		public UInt32 VirtualAddress;
+		public UInt32 SizeOfRawData;
+		public UInt32 PtrToRawData;
+		public UInt32 PtrToRelocations;
+		public UInt32 PtrToLineNumbers;
+		public UInt16 NumOfRelocations;
+		public UInt16 NumOfLines;
+		public UInt32 Characteristics;
+	}
+	
+	public static class Kernel32
+	{
+		[DllImport("kernel32.dll")]
+		public static extern IntPtr LoadLibraryEx(
+			String lpFileName,
+			IntPtr hReservedNull,
+			UInt32 dwFlags);
+	}
+"@
+
+	# Load the DLL into memory so we can refference it like LoadLibrary
+	$FileBytes = [System.IO.File]::ReadAllBytes($DllPath)
+	[IntPtr]$HModule = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($FileBytes.Length)
+	[System.Runtime.InteropServices.Marshal]::Copy($FileBytes, 0, $HModule, $FileBytes.Length)
+
+	# Some Offsets..
+	$PE_Header = [Runtime.InteropServices.Marshal]::ReadInt32($HModule.ToInt64() + 0x3C)
+	$Section_Count = [Runtime.InteropServices.Marshal]::ReadInt16($HModule.ToInt64() + $PE_Header + 0x6)
+	$Optional_Header_Size = [Runtime.InteropServices.Marshal]::ReadInt16($HModule.ToInt64() + $PE_Header + 0x14)
+	$Optional_Header = $HModule.ToInt64() + $PE_Header + 0x18
+
+	# We need some values from the Section table to calculate RVA's
+	$Section_Table = $Optional_Header + $Optional_Header_Size
+	$SectionArray = @()
+	for ($i; $i -lt $Section_Count; $i++) {
+		$HashTable = @{
+			VirtualSize = [Runtime.InteropServices.Marshal]::ReadInt32($Section_Table + 0x8)
+			VirtualAddress = [Runtime.InteropServices.Marshal]::ReadInt32($Section_Table + 0xC)
+			PtrToRawData = [Runtime.InteropServices.Marshal]::ReadInt32($Section_Table + 0x14)
+		}
+		$Object = New-Object PSObject -Property $HashTable
+		$SectionArray += $Object
+		
+		# Increment $Section_Table offset by Section size
+		$Section_Table = $Section_Table + 0x28
+	}
+
+	# Helper function for dealing with on-disk PE offsets.
+	# Adapted from @mattifestation:
+	# https://github.com/mattifestation/PowerShellArsenal/blob/master/Parsers/Get-PE.ps1#L218
+	function Convert-RVAToFileOffset($Rva, $SectionHeaders) {
+		foreach ($Section in $SectionHeaders) {
+			if (($Rva -ge $Section.VirtualAddress) -and
+				($Rva-lt ($Section.VirtualAddress + $Section.VirtualSize))) {
+				return [IntPtr] ($Rva - ($Section.VirtualAddress - $Section.PtrToRawData))
+			}
+		}
+		# Pointer did not fall in the address ranges of the section headers
+		echo "Mmm, pointer did not fall in the PE range.."
+	}
+
+	# Read Magic UShort to determin x32/x64
+	if ([Runtime.InteropServices.Marshal]::ReadInt16($Optional_Header) -eq 0x010B) {
+		echo "`n[?] 32-bit Image!"
+		# IMAGE_DATA_DIRECTORY[0] -> Export
+		$Export = $Optional_Header + 0x60
+	} else {
+		echo "`n[?] 64-bit Image!"
+		# IMAGE_DATA_DIRECTORY[0] -> Export
+		$Export = $Optional_Header + 0x70
+	}
+
+	# Convert IMAGE_EXPORT_DIRECTORY[0].VirtualAddress to file offset!
+	$ExportRVA = Convert-RVAToFileOffset $([Runtime.InteropServices.Marshal]::ReadInt32($Export)) $SectionArray
+
+	# Cast offset as IMAGE_EXPORT_DIRECTORY
+	$OffsetPtr = New-Object System.Intptr -ArgumentList $($HModule.ToInt64() + $ExportRVA)
+	$IMAGE_EXPORT_DIRECTORY = New-Object IMAGE_EXPORT_DIRECTORY
+	$IMAGE_EXPORT_DIRECTORY = $IMAGE_EXPORT_DIRECTORY.GetType()
+	$EXPORT_DIRECTORY_FLAGS = [system.runtime.interopservices.marshal]::PtrToStructure($OffsetPtr, [type]$IMAGE_EXPORT_DIRECTORY)
+
+	# Print the in-memory offsets!
+	echo "`n[>] Time Stamp: $([timezone]::CurrentTimeZone.ToLocalTime(([datetime]'1/1/1970').AddSeconds($EXPORT_DIRECTORY_FLAGS.TimeDateStamp)))"
+	echo "[>] Function Count: $($EXPORT_DIRECTORY_FLAGS.NumberOfFunctions)"
+	echo "[>] Named Functions: $($EXPORT_DIRECTORY_FLAGS.NumberOfNames)"
+	echo "[>] Ordinal Base: $($EXPORT_DIRECTORY_FLAGS.Base)"
+	echo "[>] Function Array RVA: 0x$('{0:X}' -f $EXPORT_DIRECTORY_FLAGS.AddressOfFunctions)"
+	echo "[>] Name Array RVA: 0x$('{0:X}' -f $EXPORT_DIRECTORY_FLAGS.AddressOfNames)"
+	echo "[>] Ordinal Array RVA: 0x$('{0:X}' -f $EXPORT_DIRECTORY_FLAGS.AddressOfNameOrdinals)"
+
+	# Get equivalent file offsets!
+	$ExportFunctionsRVA = Convert-RVAToFileOffset $EXPORT_DIRECTORY_FLAGS.AddressOfFunctions $SectionArray
+	$ExportNamesRVA = Convert-RVAToFileOffset $EXPORT_DIRECTORY_FLAGS.AddressOfNames $SectionArray
+	$ExportOrdinalsRVA = Convert-RVAToFileOffset $EXPORT_DIRECTORY_FLAGS.AddressOfNameOrdinals $SectionArray
+
+	# Loop exports
+	$ExportArray = @()
+	for ($i=0; $i -lt $EXPORT_DIRECTORY_FLAGS.NumberOfNames; $i++){
+		# Calculate function name RVA
+		$FunctionNameRVA = Convert-RVAToFileOffset $([Runtime.InteropServices.Marshal]::ReadInt32($HModule.ToInt64() + $ExportNamesRVA + ($i*4))) $SectionArray
+		$HashTable = @{
+			FunctionName = [System.Runtime.InteropServices.Marshal]::PtrToStringAnsi($HModule.ToInt64() + $FunctionNameRVA)
+			ImageRVA = echo "0x$("{0:X8}" -f $([Runtime.InteropServices.Marshal]::ReadInt32($HModule.ToInt64() + $ExportFunctionsRVA + ($i*4))))"
+			Ordinal = [Runtime.InteropServices.Marshal]::ReadInt16($HModule.ToInt64() + $ExportOrdinalsRVA + ($i*2)) + $EXPORT_DIRECTORY_FLAGS.Base
+		}
+		$Object = New-Object PSObject -Property $HashTable
+		$ExportArray += $Object
+	}
+
+	# Print export object
+	$ExportArray |Sort-Object Ordinal
+
+	# Optionally write ExportToC++ wrapper output
+	if ($ExportsToCpp) {
+		foreach ($Entry in $ExportArray) {
+			Add-Content $ExportsToCpp "#pragma comment (linker, '/export:$($Entry.FunctionName)=[FORWARD_DLL_HERE].$($Entry.FunctionName),@$($Entry.Ordinal)')"
+		}
+	}
+
+	# Free buffer
+	[Runtime.InteropServices.Marshal]::FreeHGlobal($HModule)
+}
+
+function Hunt-SolarBurst{
+    Write-host "Starting SolarBurst Hunt"
+
+    $SolarBurstDLL = "C:\Program Files\Solarwinds\Orion\SolarWinds.Core.BusinessLayer.dll"
+    $SolarBurstDLLAlt = "C:\Program Files (x86)\Solarwinds\Orion\SolarWinds.Core.BusinessLayer.dll"
+
+    if($localBox){
+          if(Test-Path $SolarBurstDLL){
+                Get-FileHash -Algorithm SHA256 $SolarBurstDLL | export-csv -NoTypeInformation -Append "$outFolder\Local_SolarBurst.csv" | Out-Null
+
+          }
+          if(Test-Path $SolarBurstDLLAlt){
+                Get-FileHash -Algorithm SHA256 $SolarBurstDLLAlt | export-csv -NoTypeInformation -Append "$outFolder\Local_SolarBurst.csv" | Out-Null
+          }
+    }else{    
+        foreach($i in (Get-PSSession)){           
+            (Invoke-Command -session $i -ScriptBlock {
+                if(Test-Path $SolarBurstDLL){
+                    Get-FileHash -Algorithm SHA256 $SolarBurstDLL 
+                }
+                if(Test-Path $SolarBurstDLLAlt){
+
+                    Get-FileHash -Algorithm SHA256 $SolarBurstDLLAlt
+                }
+            }  -asjob -jobname "SolarBurst") | out-null
+        }
+        Create-Artifact
+    }
+
+}
+
 function Shipto-Splunk{
     do{
         $splunk = Read-Host "Do you want to ship to splunk?(Y/N)"
@@ -603,7 +821,7 @@ function Memory-Dumper{
 function AccessibilityFeature{
     Write-host "Starting AccessibilityFeature Jobs"
     if($localBox){
-        Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\*' | export-csv -NoTypeInformation -Append "$outFolder\Local AccessibilityFeature.csv" | Out-Null
+        Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\*' | export-csv -NoTypeInformation -Append "$outFolder\Local_AccessibilityFeature.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\*' | select DisableExeptionChainValidation,MitigationOptions,PSPath,PSChildName,PSComputerName}  -asjob -jobname "AccessibilityFeature") | out-null
@@ -618,8 +836,8 @@ function AccessibilityFeature{
 function WebShell{
     Write-host "Starting WebShell Jobs"
     if($localBox){
-        gci -path "C:\inetpub\wwwroot" -recurse -File -ea SilentlyContinue | Select-String -Pattern "runat" | export-csv -NoTypeInformation -Append "$outFolder\Local WebShell.csv" | Out-Null
-        gci -path "C:\inetpub\wwwroot" -recurse -File -ea SilentlyContinue | Select-String -Pattern "eval" | export-csv -NoTypeInformation -Append "$outFolder\Local WebShell.csv" | Out-Null
+        gci -path "C:\inetpub\wwwroot" -recurse -File -ea SilentlyContinue | Select-String -Pattern "runat" | export-csv -NoTypeInformation -Append "$outFolder\Local_WebShell.csv" | Out-Null
+        gci -path "C:\inetpub\wwwroot" -recurse -File -ea SilentlyContinue | Select-String -Pattern "eval" | export-csv -NoTypeInformation -Append "$outFolder\Local_WebShell.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {
@@ -634,7 +852,7 @@ function WebShell{
 function Processes{
     Write-host "Starting Process Jobs"
     if($localBox){
-        gwmi win32_process | export-csv -NoTypeInformation -Append "$outFolder\Local Processes.csv" | Out-Null
+        gwmi win32_process | export-csv -NoTypeInformation -Append "$outFolder\Local_Processes.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {gwmi win32_process | Select-Object -Property processname,handles,path.pscomputernamename,commandline,creationdate,executablepath,parentprocessid,processid}  -asjob -jobname "Processes") | out-null
@@ -646,7 +864,7 @@ function Processes{
 function DNSCache{
     Write-host "Starting DNSCache Jobs"
     if($localBox){
-        Get-DnsClientCache | export-csv -NoTypeInformation -Append "$outFolder\Local DNSCache.csv" | Out-Null
+        Get-DnsClientCache | export-csv -NoTypeInformation -Append "$outFolder\Local_DNSCache.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {Get-DnsClientCache -ErrorAction SilentlyContinue | Select-Object -Property TTL,pscomputername,data,entry,name}  -asjob -jobname "DNSCache") | out-null
@@ -658,7 +876,7 @@ function DNSCache{
 function ProgramData{
     Write-host "Starting ProgramData Enum"
     if($localBox){
-        Get-ChildItem -Recurse C:\ProgramData | export-csv -NoTypeInformation -Append "$outFolder\Local ProgramData.csv" | Out-Null
+        Get-ChildItem -Recurse C:\ProgramData | export-csv -NoTypeInformation -Append "$outFolder\Local_ProgramData.csv" | Out-Null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -672,7 +890,7 @@ function AlternateDataStreams{
     Write-host "Starting AlternateDataStreams Enum"
     if($localBox){
         Set-Location C:\Users
-        (Get-ChildItem -Recurse).fullname | Get-Item -Stream * | ?{$_.stream -ne ':$DATA'} | export-csv -NoTypeInformation -Append "$outFolder\Local AlternateDataStreams.csv" | Out-Null
+        (Get-ChildItem -Recurse).fullname | Get-Item -Stream * | ?{$_.stream -ne ':$DATA'} | export-csv -NoTypeInformation -Append "$outFolder\Local_AlternateDataStreams.csv" | Out-Null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -688,7 +906,7 @@ function AlternateDataStreams{
 function NetshHelperDLL{
     Write-host "Starting NetshHelperDLL Enum"
     if($localBox){
-        (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Netsh') | export-csv -NoTypeInformation -Append "$outFolder\Local NetshHelperDLL.csv" | Out-Null
+        (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Netsh') | export-csv -NoTypeInformation -Append "$outFolder\Local_NetshHelperDLL.csv" | Out-Null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -704,7 +922,7 @@ function NetshHelperDLL{
 function PortMonitors{
     Write-host "Starting PortMonitors Enum"
     if($localBox){
-        (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\*") | export-csv -NoTypeInformation -Append "$outFolder\Local PortMonitors.csv" | Out-Null
+        (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\*") | export-csv -NoTypeInformation -Append "$outFolder\Local_PortMonitors.csv" | Out-Null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -720,7 +938,7 @@ function PortMonitors{
 function KnownDLLs{
     Write-host "Starting KnownDLLs Enum"
     if($localBox){
-        (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs\') | export-csv -NoTypeInformation -Append "$outFolder\Local KnownDLLs.csv" | Out-Null
+        (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs\') | export-csv -NoTypeInformation -Append "$outFolder\Local_KnownDLLs.csv" | Out-Null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -736,8 +954,8 @@ function KnownDLLs{
 function DLLSearchOrderHijacking{
     Write-host "Starting DLLSearchOrderHijacking Enum"
     if($localBox){
-        (gci -path C:\Windows\* -include *.dll | Get-AuthenticodeSignature | Where-Object Status -NE "Valid") | export-csv -NoTypeInformation -Append "$outFolder\Local DLLSearchOrderHijacking.csv" | Out-Null
-        (gci -path C:\Windows\System32\* -include *.dll | Get-AuthenticodeSignature | Where-Object Status -NE "Valid") | export-csv -NoTypeInformation -Append "$outFolder\Local DLLSearchOrderHijacking.csv" | Out-Null
+        (gci -path C:\Windows\* -include *.dll | Get-AuthenticodeSignature | Where-Object Status -NE "Valid") | export-csv -NoTypeInformation -Append "$outFolder\Local_DLLSearchOrderHijacking.csv" | Out-Null
+        (gci -path C:\Windows\System32\* -include *.dll | Get-AuthenticodeSignature | Where-Object Status -NE "Valid") | export-csv -NoTypeInformation -Append "$outFolder\Local_DLLSearchOrderHijacking.csv" | Out-Null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -756,7 +974,7 @@ function DLLSearchOrderHijacking{
 function BITSJobs{
     Write-host "Starting BITSJobs Enum"
     if($localBox){
-        Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Bits-Client/Operational'; Id='59'} | export-csv -NoTypeInformation -Append "$outFolder\Local BITSJobs.csv" | Out-Null
+        Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Bits-Client/Operational'; Id='59'} | export-csv -NoTypeInformation -Append "$outFolder\Local_BITSJobs.csv" | Out-Null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -772,7 +990,7 @@ function BITSJobs{
 function SystemFirmware{
     Write-host "Starting SystemFirmware Enum"
     if($localBox){
-        Get-WmiObject win32_bios | export-csv -NoTypeInformation -Append "$outFolder\Local SystemFirmware.csv" | Out-Null
+        Get-WmiObject win32_bios | export-csv -NoTypeInformation -Append "$outFolder\Local_SystemFirmware.csv" | Out-Null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -846,7 +1064,7 @@ function InstalledSoftware{
         }
         $UserInstalls += gci -Path HKU: | where {$_.Name -match 'S-\d-\d+-(\d+-){1,14}\d+$'} | foreach {$_.PSChildName };
         $(foreach ($User in $UserInstalls){Get-ItemProperty HKU:\$User\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*});
-        $UserInstalls = $null;try{Remove-PSDrive -Name HKU}catch{};)|where {($_.DisplayName -ne $null) -and ($_.Publisher -ne $null)} | export-csv -NoTypeInformation -Append "$outFolder\Local InstalledSoftware.csv" | Out-Null
+        $UserInstalls = $null;try{Remove-PSDrive -Name HKU}catch{};)|where {($_.DisplayName -ne $null) -and ($_.Publisher -ne $null)} | export-csv -NoTypeInformation -Append "$outFolder\Local_InstalledSoftware.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {
@@ -921,7 +1139,7 @@ function Registry{
 
                 Powershellv2 = if((test-path HKLM:\SOFTWARE\Microsoft\PowerShell\1\powershellengine\)){$true}else{$false}
             }
-            $registry | Export-Csv -NoTypeInformation -Append "$outFolder\Local Registry.csv"
+            $registry | Export-Csv -NoTypeInformation -Append "$outFolder\Local_Registry.csv"
     }else{
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {  
@@ -976,7 +1194,7 @@ function Registry{
 function AVProduct{
     Write-host "Starting AVProduct Jobs"
     if($localBox){
-       Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct -ErrorAction SilentlyContinue | select PSComputerName,displayName,pathToSignedProductExe,pathToSignedReportingExe | Export-Csv -NoTypeInformation -Append "$outFolder\Local AVProduct.csv" | out-null
+       Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct -ErrorAction SilentlyContinue | select PSComputerName,displayName,pathToSignedProductExe,pathToSignedReportingExe | Export-Csv -NoTypeInformation -Append "$outFolder\Local_AVProduct.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {Get-WmiObject -Namespace "root\SecurityCenter2" -Class AntiVirusProduct -ErrorAction SilentlyContinue | select PSComputerName,displayName,pathToSignedProductExe,pathToSignedReportingExe}  -asjob -jobname "AVProduct") | out-null
@@ -989,7 +1207,7 @@ function AVProduct{
 function Services{
     Write-host "Starting Services Jobs"
     if($localBox){
-        gwmi win32_service | export-csv -NoTypeInformation -Append "$outFolder\Local Services.csv" | Out-Null
+        gwmi win32_service | export-csv -NoTypeInformation -Append "$outFolder\Local_Services.csv" | Out-Null
     }else{ 
         foreach($i in (Get-PSSession)){         
             (Invoke-Command -session $i -ScriptBlock  {gwmi win32_service | Select-Object -Property PSComputerName,caption,description,pathname,processid,startname,state}  -asjob -jobname "Services")| out-null
@@ -1001,7 +1219,7 @@ function Services{
 function PoshVersion{
     Write-host "Starting PoshVersion Jobs"
     if($localBox){
-        Get-WindowsOptionalFeature -Online -FeatureName microsoftwindowspowershellv2 | export-csv -NoTypeInformation -Append "$outFolder\Local PoshVersion.csv" | Out-Null
+        Get-WindowsOptionalFeature -Online -FeatureName microsoftwindowspowershellv2 | export-csv -NoTypeInformation -Append "$outFolder\Local_PoshVersion.csv" | Out-Null
     }else{ 
         foreach($i in (Get-PSSession)){         
             (Invoke-Command -session $i -ScriptBlock  {Get-WindowsOptionalFeature -Online -FeatureName microsoftwindowspowershellv2 | Select-Object -Property PSComputerName,FeatureName,State,LogPath}  -asjob -jobname "PoshVersion")| out-null
@@ -1013,7 +1231,7 @@ function PoshVersion{
 function Startup{
     Write-host "Starting Startup Jobs"
     if($localBox){
-        gwmi win32_startupcommand | export-csv -NoTypeInformation -Append "$outFolder\Local Startup.csv" | out-null
+        gwmi win32_startupcommand | export-csv -NoTypeInformation -Append "$outFolder\Local_Startup.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){   
             (Invoke-Command -session $i -ScriptBlock  {gwmi win32_startupcommand | Select-Object -Property PSComputerName,Caption,Command,Description,Location,User}  -asjob -jobname "Startup")| out-null         
@@ -1028,8 +1246,8 @@ function Startup{
 function StartupFolder{
     Write-host "Starting StartupFolder Jobs"
     if($localBox){
-        gci -path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*" <#-include *.lnk,*.url#> -ErrorAction SilentlyContinue | export-csv -NoTypeInformation -Append "$outFolder\Local StartupFolder.csv" | out-null
-        gci -path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" <#-include *.lnk,*.url#> -ErrorAction SilentlyContinue | export-csv -NoTypeInformation -Append "$outFolder\Local StartupFolder.csv" | out-null
+        gci -path "C:\Users\*\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\*" <#-include *.lnk,*.url#> -ErrorAction SilentlyContinue | export-csv -NoTypeInformation -Append "$outFolder\Local_StartupFolder.csv" | out-null
+        gci -path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\*" <#-include *.lnk,*.url#> -ErrorAction SilentlyContinue | export-csv -NoTypeInformation -Append "$outFolder\Local_StartupFolder.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){   
             (Invoke-Command -session $i -ScriptBlock  {
@@ -1044,7 +1262,7 @@ function StartupFolder{
 function Drivers{
     Write-host "Starting Driver Jobs"
     if($localBox){
-        gwmi win32_systemdriver | export-csv -NoTypeInformation -Append "$outFolder\Local Drivers.csv" | Out-Null
+        gwmi win32_systemdriver | export-csv -NoTypeInformation -Append "$outFolder\Local_Drivers.csv" | Out-Null
     }else{ 
         foreach($i in (Get-PSSession)){         
             (Invoke-Command -session $i -ScriptBlock  {gwmi win32_systemdriver | Select-Object -Property PSComputerName,caption,description,name,pathname,started,startmode,state}  -asjob -jobname "Drivers")| out-null         
@@ -1058,7 +1276,7 @@ function DriverHash{
     if($localBox){
         $driverPath = (gwmi win32_systemdriver).pathname          
             foreach($driver in $driverPath){                
-                    (Get-filehash -algorithm SHA256 -path $driver -ErrorAction SilentlyContinue) | export-csv -NoTypeInformation -Append "$outFolder\Local DriverHashes.csv" | out-null                
+                    (Get-filehash -algorithm SHA256 -path $driver -ErrorAction SilentlyContinue) | export-csv -NoTypeInformation -Append "$outFolder\Local_DriverHashes.csv" | out-null                
             }
     }else{
         foreach($i in (Get-PSSession)){           
@@ -1076,7 +1294,7 @@ function DriverHash{
 function EnvironVars{
     Write-host "Starting EnvironVars Jobs"
     if($localBox){
-        gwmi win32_environment|?{$_.name -ne "OneDrive"} | export-csv -NoTypeInformation -Append "$outFolder\Local EnvironVars.csv" | Out-Null
+        gwmi win32_environment|?{$_.name -ne "OneDrive"} | export-csv -NoTypeInformation -Append "$outFolder\Local_EnvironVars.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){         
             (Invoke-Command -session $i -ScriptBlock  {gwmi win32_environment |?{$_.name -ne "OneDrive"} | Select-Object -Property PSComputerName,name,description,username,variablevalue}  -asjob -jobname "EnvironVars")| out-null         
@@ -1088,7 +1306,7 @@ function EnvironVars{
 function NetAdapters{
     Write-host "Starting NetAdapter Jobs"
     if($localBox){
-        gwmi win32_networkadapterconfiguration | Export-Csv -NoTypeInformation -Append "$outFolder\Local NetAdapters.csv" | out-null
+        gwmi win32_networkadapterconfiguration | Export-Csv -NoTypeInformation -Append "$outFolder\Local_NetAdapters.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){         
             (Invoke-Command -session $i -ScriptBlock  {gwmi win32_networkadapterconfiguration | Select-Object -Property PSComputerName,Description,IPAddress,IPSubnet,MACAddress,servicename}  -asjob -jobname "NetAdapters")| out-null        
@@ -1100,7 +1318,7 @@ function NetAdapters{
 function SystemInfo{
     Write-host "Starting SystemInfo Jobs"
     if($localBox){
-        gwmi win32_computersystem | export-csv -NoTypeInformation -Append "$outFolder\Local Systeminfo.csv" | out-null
+        gwmi win32_computersystem | export-csv -NoTypeInformation -Append "$outFolder\Local_Systeminfo.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {gwmi win32_computersystem | Select-Object -Property PSComputerName,domain,manufacturer,model,primaryownername,totalphysicalmemory,username}  -asjob -jobname "SystemInfo")| out-null         
@@ -1112,7 +1330,7 @@ function SystemInfo{
 function Logons{
     Write-host "Starting Logon Jobs"
     if($localBox){
-        gwmi win32_networkloginprofile | export-csv -NoTypeInformation -Append "$outFolder\Local Logons.csv" | Out-Null
+        gwmi win32_networkloginprofile | export-csv -NoTypeInformation -Append "$outFolder\Local_Logons.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
             (Invoke-Command -session $i -ScriptBlock  {gwmi win32_networkloginprofile}  -asjob -jobname "Logons")| out-null         
@@ -1124,7 +1342,7 @@ function Logons{
 function NetConns{
     Write-host "Starting NetConn Jobs"
     if($localBox){
-        Get-NetTCPConnection | export-csv -NoTypeInformation -Append "$outFolder\Local NetConn.csv" | Out-Null
+        Get-NetTCPConnection | export-csv -NoTypeInformation -Append "$outFolder\Local_NetConn.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
             (Invoke-Command -session $i -ScriptBlock  {get-NetTcpConnection}  -asjob -jobname "NetConn")| out-null        
@@ -1136,7 +1354,7 @@ function NetConns{
 function SMBShares{
     Write-host "Starting SMBShare Jobs"
     if($localBox){
-        Get-SmbShare | export-csv -NoTypeInformation -Append "$outFolder\Local SMBShares.csv" | Out-Null
+        Get-SmbShare | export-csv -NoTypeInformation -Append "$outFolder\Local_SMBShares.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {get-Smbshare}  -asjob -jobname "SMBShares")| out-null        
@@ -1148,7 +1366,7 @@ function SMBShares{
 function SMBConns{
     Write-host "Starting SMBConn Jobs"
     if($localBox){
-        Get-SmbConnection | export-csv -NoTypeInformation -Append "$outFolder\Local SMBConns.csv" | Out-Null
+        Get-SmbConnection | export-csv -NoTypeInformation -Append "$outFolder\Local_SMBConns.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){         
             (Invoke-Command -session $i -ScriptBlock  {get-SmbConnection}  -asjob -jobname "SMBConns")| out-null      
@@ -1160,7 +1378,7 @@ function SMBConns{
 function SchedTasks{
     Write-host "Starting SchedTask Jobs"
     if($localBox){
-        Get-ScheduledTask | Export-Csv -NoTypeInformation -Append "$outFolder\Local SchedTasks.csv" | Out-Null
+        Get-ScheduledTask | Export-Csv -NoTypeInformation -Append "$outFolder\Local_SchedTasks.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {get-scheduledtask -ErrorAction SilentlyContinue}  -asjob -jobname "SchedTasks")| out-null         
@@ -1177,7 +1395,7 @@ function ProcessHash{
             $execpaths = [System.Collections.ArrayList]@();foreach($i in $pathsofexe){$execpaths.Add($i.executablepath)| Out-Null}
             foreach($i in $execpaths){
                 if($i -ne $null){
-                    (Get-filehash -algorithm SHA256 -path $i -ErrorAction SilentlyContinue) | export-csv -NoTypeInformation -Append "$outFolder\Local ProcessHash.csv" | Out-Null
+                    (Get-filehash -algorithm SHA256 -path $i -ErrorAction SilentlyContinue) | export-csv -NoTypeInformation -Append "$outFolder\Local_ProcessHash.csv" | Out-Null
                 }
             }
     }else{
@@ -1200,7 +1418,7 @@ function ProcessHash{
 function PrefetchListing{
     Write-host "Starting PrefetchListing Jobs"
     if($localBox){
-        Get-ChildItem "C:\Windows\Prefetch" | export-csv -NoTypeInformation -Append "$outFolder\Local PrefetchListing.csv" | Out-Null
+        Get-ChildItem "C:\Windows\Prefetch" | export-csv -NoTypeInformation -Append "$outFolder\Local_PrefetchListing.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {Get-ChildItem "C:\Windows\Prefetch"}  -asjob -jobname "PrefetchListing")| out-null         
@@ -1212,7 +1430,7 @@ function PrefetchListing{
 function PNPDevices{
     Write-host "Starting PNP Device Jobs"
     if($localBox){
-        gwmi win32_pnpentity | export-csv -NoTypeInformation -Append "$outFolder\Local PNPDevices.csv" | Out-Null
+        gwmi win32_pnpentity | export-csv -NoTypeInformation -Append "$outFolder\Local_PNPDevices.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {gwmi win32_pnpentity}  -asjob -jobname "PNPDevices")| out-null         
@@ -1224,7 +1442,7 @@ function PNPDevices{
 function LogicalDisks{
     Write-host "Starting Logical Disk Jobs"
     if($localBox){
-        gwmi win32_logicaldisk | export-csv -NoTypeInformation -Append "$outFolder\Local LogicalDisks.csv" | Out-Null
+        gwmi win32_logicaldisk | export-csv -NoTypeInformation -Append "$outFolder\Local_LogicalDisks.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {gwmi win32_logicaldisk}  -asjob -jobname "LogicalDisks")| out-null         
@@ -1236,7 +1454,7 @@ function LogicalDisks{
 function DiskDrives{
     Write-host "Starting Disk Drive Jobs"
     if($localBox){
-        gwmi win32_diskdrive | export-csv -NoTypeInformation -Append "$outFolder\Local DiskDrives.csv" | Out-Null
+        gwmi win32_diskdrive | export-csv -NoTypeInformation -Append "$outFolder\Local_DiskDrives.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {gwmi win32_diskdrive}  -asjob -jobname "DiskDrives")| out-null         
@@ -1248,7 +1466,7 @@ function DiskDrives{
 function WMIEventFilters{
     Write-host "Starting WMIEventFilter Jobs"
     if($localBox){
-        Get-WMIObject -Namespace root\Subscription -Class __EventFilter | Export-Csv -NoTypeInformation -Append "$outFolder\Local WMIEventFilters.csv" | out-null
+        Get-WMIObject -Namespace root\Subscription -Class __EventFilter | Export-Csv -NoTypeInformation -Append "$outFolder\Local_WMIEventFilters.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {Get-WMIObject -Namespace root\Subscription -Class __EventFilter}  -asjob -jobname "WMIEventFilters")| out-null         
@@ -1260,7 +1478,7 @@ function WMIEventFilters{
 function WMIEventConsumers{
     Write-host "Starting WMIEventConsumer Jobs"
     if($localBox){
-        Get-WMIObject -Namespace root\Subscription -Class __EventConsumer | export-csv -NoTypeInformation -Append "$outFolder\Local WMIEventConsumers.csv" | Out-Null
+        Get-WMIObject -Namespace root\Subscription -Class __EventConsumer | export-csv -NoTypeInformation -Append "$outFolder\Local_WMIEventConsumers.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {Get-WMIObject -Namespace root\Subscription -Class __EventConsumer}  -asjob -jobname "WMIEventConsumers")| out-null         
@@ -1272,7 +1490,7 @@ function WMIEventConsumers{
 function WMIEventConsumerBinds{
     Write-host "Starting WMIEventConsumerBind Jobs"
     if($localBox){
-        Get-WMIObject -Namespace root\Subscription -Class __FilterToConsumerBinding | Export-Csv -NoTypeInformation -Append "$outFolder\Local WMIEventConsumerBinds.csv" | Out-Null
+        Get-WMIObject -Namespace root\Subscription -Class __FilterToConsumerBinding | Export-Csv -NoTypeInformation -Append "$outFolder\Local_WMIEventConsumerBinds.csv" | Out-Null
     }else{
         foreach($i in (Get-PSSession)){
              (Invoke-Command -session $i -ScriptBlock  {Get-WMIObject -Namespace root\Subscription -Class __FilterToConsumerBinding}  -asjob -jobname "WMIEventConsumerBinds")| out-null         
@@ -1284,7 +1502,7 @@ function WMIEventConsumerBinds{
 function DLLs{
     Write-host "Starting Loaded DLL Jobs"
     if($localBox){
-        Get-Process -Module -ErrorAction SilentlyContinue | Export-Csv -NoTypeInformation -Append "$outFolder\Local DLLs.csv" | out-null
+        Get-Process -Module -ErrorAction SilentlyContinue | Export-Csv -NoTypeInformation -Append "$outFolder\Local_DLLs.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {Get-Process -Module -ErrorAction SilentlyContinue}  -asjob -jobname "DLLs") | out-null
@@ -1299,9 +1517,9 @@ function DLLs{
 function LSASSDriver{
     Write-host "Starting LSASSDriver Jobs"
     if($localBox){
-        Get-WinEvent -FilterHashtable @{ LogName='Security'; Id='4614';} -ErrorAction SilentlyContinue | Export-Csv -NoTypeInformation -Append "$outFolder\Local LSASSDriver.csv" | out-null
-        Get-WinEvent -FilterHashtable @{ LogName='Security'; Id='3033';} -ErrorAction SilentlyContinue | Export-Csv -NoTypeInformation -Append "$outFolder\Local LSASSDriver.csv" | out-null
-        Get-WinEvent -FilterHashtable @{ LogName='Security'; Id='3063';} -ErrorAction SilentlyContinue | Export-Csv -NoTypeInformation -Append "$outFolder\Local LSASSDriver.csv" | out-null
+        Get-WinEvent -FilterHashtable @{ LogName='Security'; Id='4614';} -ErrorAction SilentlyContinue | Export-Csv -NoTypeInformation -Append "$outFolder\Local_LSASSDriver.csv" | out-null
+        Get-WinEvent -FilterHashtable @{ LogName='Security'; Id='3033';} -ErrorAction SilentlyContinue | Export-Csv -NoTypeInformation -Append "$outFolder\Local_LSASSDriver.csv" | out-null
+        Get-WinEvent -FilterHashtable @{ LogName='Security'; Id='3063';} -ErrorAction SilentlyContinue | Export-Csv -NoTypeInformation -Append "$outFolder\Local_LSASSDriver.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {
@@ -1321,7 +1539,7 @@ function DLLHash{
             $a = $a.FileName.ToUpper() | sort
             $a = $a | Get-Unique
             foreach($file in $a){
-                Get-FileHash -Algorithm SHA256 $file | Export-Csv -NoTypeInformation -Append "$outFolder\Local DLLHash.csv" | Out-Null
+                Get-FileHash -Algorithm SHA256 $file | Export-Csv -NoTypeInformation -Append "$outFolder\Local_DLLHash.csv" | Out-Null
             }
     }else{
         foreach($i in (Get-PSSession)){           
@@ -1342,7 +1560,7 @@ function DLLHash{
 function UnsignedDrivers{
     Write-host "Starting UnsignedDrivers Jobs"
     if($localBox){
-        gci -path C:\Windows\System32\drivers -include *.sys -recurse -ea SilentlyContinue | Get-AuthenticodeSignature | where {$_.status -ne 'Valid'} | Export-Csv -NoTypeInformation -Append "$outFolder\Local UnsignedDrivers.csv" | out-null
+        gci -path C:\Windows\System32\drivers -include *.sys -recurse -ea SilentlyContinue | Get-AuthenticodeSignature | where {$_.status -ne 'Valid'} | Export-Csv -NoTypeInformation -Append "$outFolder\Local_UnsignedDrivers.csv" | out-null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -1355,7 +1573,7 @@ function UnsignedDrivers{
 function Hotfix{
     Write-host "Starting Hotfix Jobs"
     if($localBox){
-        Get-HotFix -ErrorAction SilentlyContinue| Export-Csv -NoTypeInformation -Append "$outFolder\Local Hotfix.csv" | out-null
+        Get-HotFix -ErrorAction SilentlyContinue| Export-Csv -NoTypeInformation -Append "$outFolder\Local_Hotfix.csv" | out-null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -1368,7 +1586,7 @@ function Hotfix{
 function ArpCache{
     Write-host "Starting ArpCache Jobs"
     if($localBox){
-        Get-NetNeighbor| Export-Csv -NoTypeInformation -Append "$outFolder\Local ArpCache.csv" | out-null
+        Get-NetNeighbor| Export-Csv -NoTypeInformation -Append "$outFolder\Local_ArpCache.csv" | out-null
     
     }else{
         foreach($i in (Get-PSSession)){
@@ -1678,7 +1896,7 @@ function VisibleWirelessNetworks{
 
                         $networksarraylist.Add($WLANobject) | Out-Null
                     }
-                    $networksarraylist | Export-Csv -NoTypeInformation -Append "$outFolder\Local VisibleWirelessNetworks.csv" | out-null
+                    $networksarraylist | Export-Csv -NoTypeInformation -Append "$outFolder\Local_VisibleWirelessNetworks.csv" | out-null
                 }
     }else{
         foreach($i in (Get-PSSession)){
@@ -1783,7 +2001,7 @@ function HistoricalWiFiConnections{
                         $WLANProfileObject.connectionmode = $individualProfile[12].substring(29)
                     }
                 }
-                $networksarraylist | Export-Csv -NoTypeInformation -Append "$outFolder\Local HistoricalWiFiConnections.csv" | out-null
+                $networksarraylist | Export-Csv -NoTypeInformation -Append "$outFolder\Local_HistoricalWiFiConnections.csv" | out-null
     }else{
         foreach($i in (Get-PSSession)){
             (Invoke-Command -session $i -ScriptBlock{
@@ -1822,7 +2040,7 @@ function HistoricalFirewallChanges{
     
     Write-host "Starting HistoricalFirewallChanges Jobs"
     if($localBox){
-        Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Windows Firewall With Advanced Security/Firewall';} | select timecreated,message | export-csv -NoTypeInformation -Append "$outFolder\Local HistoricalFirewallChanges.csv" | Out-Null
+        Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Windows Firewall With Advanced Security/Firewall';} | select timecreated,message | export-csv -NoTypeInformation -Append "$outFolder\Local_HistoricalFirewallChanges.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Windows Firewall With Advanced Security/Firewall';} | select TimeCreated, Message}  -asjob -jobname "HistoricalFirewallChanges") | out-null
@@ -1864,7 +2082,7 @@ function CapabilityAccessManager{
     
     Write-host "Starting CapabilityAccessManager Jobs"
     if($localBox){
-        (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\*\NonPackaged\*) | export-csv -NoTypeInformation -Append "$outFolder\Local CapabilityAccessManager.csv" | Out-Null
+        (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\*\NonPackaged\*) | export-csv -NoTypeInformation -Append "$outFolder\Local_CapabilityAccessManager.csv" | Out-Null
     }else{    
         foreach($i in (Get-PSSession)){           
             (Invoke-Command -session $i -ScriptBlock  {(Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\*\NonPackaged\*)}  -asjob -jobname "CapabilityAccessManager") | out-null
@@ -2100,6 +2318,7 @@ function Meta-Blue {
     Write-Host -ForegroundColor Yellow "[+]If it doesn't move on for a while, give it a try!"
     Write-Host -ForegroundColor Yellow "[+]Someone figure out how to make this not happen and I will give you a cookie" 
     
+    Hunt-SolarBurst
     CurveBall
     PortProxy
     UACBypassFodHelper
@@ -2168,22 +2387,6 @@ function Meta-Blue {
     #Shipto-Splunk
     cd $outFolder
          
-}
-
-function Generate-IPSpaceTextFile{
-    
-    $subnets = Read-Host "How many seperate subnets are there?"
-
-    $ips = @()
-
-    for($i = 0; $i -lt $subnets; $i++){
-        $ipa = Read-Host "[$($i +1)]Please enter the network id to scan"
-        $cidr = Read-Host "[$($i +1)]Please enter the CIDR"
-        $ips += Get-SubnetRange -IPAddress $ipa -CIDR $cidr
-    }
-    $ips >> $outFolder\ipspace.txt
-    break
-
 }
 
 function Show-TitleMenu{
@@ -2298,14 +2501,14 @@ function Show-EnumMenu{
 
 function Show-CollectionMenu{
     cls
-     Write-Host "================META-BLUE================"
-     Write-Host "============Artifact Collection ================"
-     Write-Host "          Please Make a Selection               "
-     Write-Host "1: Collect from a list of hosts"
-     Write-Host "2: Collect from a network enumeration"
-     Write-Host "3: Collect from active directory list (RSAT required!!)"
-     Write-Host "4: Return to Previous menu."
-     Write-Host "Q: Press 'Q' to quit."
+    Write-Host "================META-BLUE================"
+    Write-Host "============Artifact Collection ================"
+    Write-Host "          Please Make a Selection               "
+    Write-Host "1: Collect from a list of hosts"
+    Write-Host "2: Collect from a network enumeration"
+    Write-Host "3: Collect from active directory list (RSAT required!!)"
+    Write-Host "4: Return to Previous menu."
+    Write-Host "Q: Press 'Q' to quit."
 
                 do{
                 $input = Read-Host "Please make a selection(collection)"
@@ -2333,7 +2536,7 @@ function Show-CollectionMenu{
                                         $nodeObj.IPaddress = $node.IPAddress
                                         $nodeObj.OperatingSystem = $node.OperatingSystem
                                         $nodeObj.TTL = $node.TTL
-                                        $nodeList.Add($node) | out-null
+                                        $nodeList.Add($nodeObj) | out-null
                                     }
                                 }
                                 
