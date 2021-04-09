@@ -11,7 +11,7 @@
     Author         : newhandle
     Prerequisite   : PowerShell
     Created        : 1 Oct 18
-    Change Date    : July 27th 2020
+    Change Date    : April 9th 2021
     
 #>
 
@@ -2392,6 +2392,7 @@ function Meta-Blue {
 function Show-TitleMenu{
      cls
      Write-Host "================META-BLUE================"
+     Write-Host "Tabs over spaces. Ain't nothin but a G thang"
     
      Write-Host "1: Press '1' to run Meta-Blue as enumeration only."
      Write-Host "2: Press '2' to run Meta-Blue as both enumeration and artifact collection."
